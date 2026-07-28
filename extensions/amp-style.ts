@@ -17,26 +17,29 @@
  * - Bottom border: animated `≈ Thinking 13 tok` on the left while working,
  *   abbreviated cwd on the right. Scroll indicators (`↑ N more`) are preserved.
  * - `∴ Running bash · read` widget line above the box while tools execute.
- * - Native footer path/stats lines and the stock `Working...` spinner are
- *   suppressed (their info lives in the border); extension status lines from
- *   `ctx.ui.setStatus` are kept. Retry/compaction loaders stay visible.
+ * - The stock footer is replaced via the official `ctx.ui.setFooter` API:
+ *   only extension status lines (`ctx.ui.setStatus`) remain, dimmed, minus a
+ *   small hidden-key list (`cursor` — redundant with the border's model) —
+ *   path/model/context live in the editor border. The stock `Working...` spinner is
+ *   blanked (prototype patch, kept deliberately: its animation timer drives
+ *   the border-spinner repaints). Retry/compaction loaders stay visible.
  *
- * Implementation: prototype patches applied at load time. Every patch is guarded —
- * if a future pi version renames these internals, patches degrade to no-ops
- * instead of crashing, and a one-time load notice names the failed patches.
- * Live data (model, thinking level, context, cost) is read through the
- * extension context's stable getters at render time, never cached from event
- * snapshots.
+ * Implementation: official extension APIs where pi provides them (footer,
+ * widgets); prototype patches applied at load time for the rest. Every patch
+ * is guarded — if a future pi version renames these internals, patches degrade
+ * to no-ops instead of crashing, and a one-time load notice names the failed
+ * patches. Live data (model, thinking level, context, cost) is read through
+ * the extension context's stable getters at render time, never cached from
+ * event snapshots.
  */
 import {
 	AssistantMessageComponent,
 	CustomEditor,
-	FooterComponent,
 	ToolExecutionComponent,
 	UserMessageComponent,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { Loader, TUI } from "@earendil-works/pi-tui";
+import { Loader, TUI, truncateToWidth } from "@earendil-works/pi-tui";
 
 // ── constants ────────────────────────────────────────────────────────────────
 
@@ -258,6 +261,7 @@ function wireEvents(pi: ExtensionAPI) {
 	const track = (_event: any, ctx: any) => {
 		if (ctx) lastCtx = ctx;
 		if (ctx?.thinkingLevel) thinkingLevel = ctx.thinkingLevel;
+		applyFooter(ctx);
 	};
 	for (const ev of ["session_start", "turn_start", "turn_end", "model_select"]) on(ev, track);
 	on("thinking_level_select", (event, ctx) => {
@@ -485,40 +489,51 @@ function patchCardGrouping() {
 	};
 }
 
-/** Stock footer is always `[pwd, stats, ...extensionStatuses]`. Drop the two
- *  stock lines (path/model/context already live in the editor border) and keep
- *  extension status lines from `ctx.ui.setStatus`. If the shape doesn't match,
- *  blank the footer rather than showing a duplicated stock line. */
-function filterFooterLines(lines: string[]): string[] {
-	if (lines.length < 2) return [];
-	const pwd = stripAnsi(lines[0]).trim();
-	const stats = stripAnsi(lines[1]).trim();
-	const pwdOk = /^(~|\/|[A-Za-z]:)/.test(pwd) || pwd.includes(" • ");
-	// Context window marker like `8.6%/128k` or `?/128k`, with optional token/cost stats.
-	const statsOk = /(?:\d+(?:\.\d+)?%|\?)\/\S+/.test(stats);
-	if (!pwdOk || !statsOk) return [];
-	return lines.slice(2);
+/** Status keys hidden from the footer. `cursor` (pi-cursor-sdk's
+ *  `cursor:local · fast:on`) is redundant — the model already shows in the
+ *  editor border. */
+const HIDDEN_STATUS_KEYS = new Set(["cursor"]);
+
+/** Replace the stock footer via the official `ctx.ui.setFooter` API: only
+ *  extension status lines (`ctx.ui.setStatus`) remain, dimmed, minus
+ *  `HIDDEN_STATUS_KEYS` — path/model/context already live in the editor
+ *  border. Runs once, on the first event whose context has a UI; degrades to
+ *  the stock footer if the API is missing. */
+let footerApplied = false;
+function applyFooter(ctx: any) {
+	if (footerApplied || !ctx?.hasUI) return;
+	footerApplied = true;
+	if (typeof ctx.ui?.setFooter !== "function") {
+		try {
+			ctx.ui?.notify?.("amp-pi-style: ctx.ui.setFooter unavailable — stock footer kept", "warning");
+		} catch {}
+		return;
+	}
+	ctx.ui.setFooter((_tui: any, _theme: any, footerData: any) => ({
+		render(width: number) {
+			try {
+				const statuses = footerData?.getExtensionStatuses?.();
+				if (!statuses?.size) return [];
+				const text = [...statuses.entries()]
+					.filter(([key]) => !HIDDEN_STATUS_KEYS.has(key))
+					.sort(([a], [b]) => a.localeCompare(b))
+					.map(([, t]) => String(t).replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
+					.filter(Boolean)
+					.join(" ");
+				return text ? [`${DIM}${truncateToWidth(text, width)}${UNDIM}`] : [];
+			} catch {
+				return [];
+			}
+		},
+	}));
 }
 
-/** Hide stock footer chrome and the stock `Working...` spinner line — their
- *  info lives in the editor border. Extension status lines and retry/compaction
- *  loaders stay visible. */
+/** Hide the stock `Working...` spinner line — its info lives in the editor
+ *  border. Retry/compaction loaders stay visible. Kept as a prototype patch on
+ *  purpose: `setWorkingVisible(false)` would skip creating the working loader,
+ *  and with it the animation timer whose `requestRender` repaints our border
+ *  spinner between stream events. */
 function patchChrome() {
-	const footProto = FooterComponent?.prototype as any;
-	if (!footProto) {
-		guard("footer", false);
-	} else if (!footProto.__ampStyle) {
-		footProto.__ampStyle = true;
-		const origRender = footProto.render;
-		if (typeof origRender !== "function") {
-			guard("footer", false);
-		} else {
-			footProto.render = function (width: number) {
-				return filterFooterLines(origRender.call(this, width));
-			};
-		}
-	}
-
 	const loaderProto = Loader?.prototype as any;
 	if (!loaderProto) {
 		guard("loader", false);
