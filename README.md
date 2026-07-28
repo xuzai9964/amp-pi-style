@@ -18,7 +18,7 @@ Amp-inspired look & feel for the [pi coding agent](https://github.com/earendil-w
 - Top border: `$0.012 ─ grok-4.5 ─ 8.6% ─ medium` — live session cost, model, context usage, thinking level.
 - Bottom border: animated `≈ Thinking 13 tok` while the agent works; abbreviated cwd (`~/…/PhD/00_thesis`) on the right.
 - `∴ Running bash · read` activity line above the box while tools execute.
-- The native footer and stock `Working...` spinner are folded into the border (retry/compaction notices stay).
+- Stock footer path/stats and the `Working...` spinner are folded into the border; extension status lines (`ctx.ui.setStatus`) still show. Retry/compaction notices stay.
 
 **Themes**
 
@@ -52,12 +52,7 @@ For output *density* (the model's writing habits, which no renderer can fix), ad
 
 ## How it works / caveats
 
-The extension patches pi's exported TUI component prototypes at load time (user/assistant messages, tool cards, editor, footer, loader, and a line-level pass over the final TUI render for card grouping). Every patch is guarded: if a future pi version renames these internals, the patches degrade to no-ops instead of crashing — the UI just reverts to stock until this package is updated. Live values (model, thinking level, context, cost) are read through the extension context's stable getters at render time.
-
-Known trade-offs:
-
-- Hiding the footer also hides extension status lines (e.g. `cursor:local`).
-- Card grouping matches rendered card lines; if another extension renders lines that start with `✓ $ ` it would be grouped too (unlikely in practice).
+The extension patches pi's exported TUI component prototypes at load time (user/assistant messages, tool cards, editor, footer, loader, and a line-level pass over the final TUI render for card grouping). Every patch is guarded: if a future pi version renames these internals, the patches degrade to no-ops instead of crashing — the UI reverts to stock and a one-time load notice names the failed patches. Live values (model, thinking level, context, cost) are read through the extension context's stable getters at render time. Collapsed tool cards carry an invisible marker so grouping only merges this package's cards.
 
 ## License
 

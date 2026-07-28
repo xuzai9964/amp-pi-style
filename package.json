@@ -1,6 +1,6 @@
 {
   "name": "amp-pi-style",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Amp-inspired look for the pi coding agent: flat theme, compact spacing, italic user messages with an accent bar",
   "type": "module",
   "keywords": [

@@ -9,6 +9,7 @@
  * - Tool calls: collapsed to Amp-style one-liners — `✓ Edited path +5 -1 ▸`,
  *   `✗ $ cmd ▸`, animated `∴` while running; ctrl+o expands to the full renderer.
  *   Consecutive command/read cards merge: `✗ Ran 15 commands, 2 failed ▸`.
+ *   Collapsed cards carry an invisible marker so grouping only merges our cards.
  *
  * Editor
  * - Rounded box; border color still tracks thinking level / bash mode.
@@ -16,14 +17,16 @@
  * - Bottom border: animated `≈ Thinking 13 tok` on the left while working,
  *   abbreviated cwd on the right. Scroll indicators (`↑ N more`) are preserved.
  * - `∴ Running bash · read` widget line above the box while tools execute.
- * - Native footer and the stock `Working...` spinner line are suppressed
- *   (their info lives in the border now); retry/compaction loaders stay visible.
+ * - Native footer path/stats lines and the stock `Working...` spinner are
+ *   suppressed (their info lives in the border); extension status lines from
+ *   `ctx.ui.setStatus` are kept. Retry/compaction loaders stay visible.
  *
  * Implementation: prototype patches applied at load time. Every patch is guarded —
  * if a future pi version renames these internals, patches degrade to no-ops
- * instead of crashing. Live data (model, thinking level, context, cost) is read
- * through the extension context's stable getters at render time, never cached
- * from event snapshots.
+ * instead of crashing, and a one-time load notice names the failed patches.
+ * Live data (model, thinking level, context, cost) is read through the
+ * extension context's stable getters at render time, never cached from event
+ * snapshots.
  */
 import {
 	AssistantMessageComponent,
@@ -56,6 +59,8 @@ const EDIT_TOOLS = new Set(["edit", "write", "cursor", "apply_patch", "multiedit
 const CARD_RE = /^([✓✗]) (\$ |Read |Edited |Wrote )/;
 /** Diff stats at the end of an edit card: `+5 -1 ▸`. */
 const CARD_STATS_RE = /\+(\d+) -(\d+) ▸\s*$/;
+/** Invisible marker appended to our collapsed cards so grouping ignores lookalikes. */
+const CARD_MARK = "\u200b";
 
 /** Leading OSC sequences (e.g. OSC 133 semantic-prompt marks) that must stay at
  *  the very start of a line — semantic-prompt terminals (Ghostty, iTerm2) break
@@ -71,15 +76,24 @@ let workTokens = 0;
 let activeTools = 0;
 let costCache = { entryCount: -1, value: 0 };
 let ctxUsageCache = { at: 0, value: null as any };
+const failedPatches: string[] = [];
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replaceAll(CARD_MARK, "");
 
-/** Visible column width, counting CJK as 2 columns. */
+/** Record a failed prototype patch once at load (never per-render). */
+function guard(name: string, ok: boolean) {
+	if (!ok) failedPatches.push(name);
+}
+
+/** Visible column width, counting CJK as 2 columns. Zero-width marks count 0. */
 function colWidth(s: string): number {
 	let w = 0;
-	for (const ch of s) w += /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]/.test(ch) ? 2 : 1;
+	for (const ch of s) {
+		if (ch === CARD_MARK || ch === "\uFEFF") continue;
+		w += /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]/.test(ch) ? 2 : 1;
+	}
 	return w;
 }
 
@@ -153,7 +167,8 @@ function afterLeadingOsc(line: string, text: string): string {
 type CardCat = "cmd" | "read" | "edit";
 
 function cardInfo(line: string | undefined): { icon: string; cat: CardCat; add: number; del: number } | null {
-	const plain = stripAnsi(line ?? "");
+	if (!line?.includes(CARD_MARK)) return null;
+	const plain = stripAnsi(line);
 	const m = plain.match(CARD_RE);
 	if (!m) return null;
 	const cat: CardCat = m[2].startsWith("$") ? "cmd" : m[2].startsWith("Read") ? "read" : "edit";
@@ -194,7 +209,7 @@ function mergeToolCards(lines: string[]): string[] {
 			}
 			const icon = failed ? `${RED}✗${RESETFG}` : `${GREEN}✓${RESETFG}`;
 			const fail = failed ? `, ${RED}${failed} failed${RESETFG}` : "";
-			out.push(`${icon} ${noun}${fail}${stats} ${DIM}▸${UNDIM}`);
+			out.push(`${icon} ${noun}${fail}${stats} ${DIM}▸${UNDIM}${CARD_MARK}`);
 			i = j + 1;
 		} else {
 			out.push(lines[i]);
@@ -214,6 +229,23 @@ export default function ampStyle(pi: ExtensionAPI) {
 	patchCardGrouping();
 	patchChrome();
 	patchEditor();
+	if (failedPatches.length) {
+		const msg = `amp-pi-style: degraded patches: ${failedPatches.join(", ")} — stock UI until package is updated`;
+		console.error(msg);
+		let notified = false;
+		const warn = (_event: any, ctx: any) => {
+			if (notified) return;
+			notified = true;
+			try {
+				ctx?.ui?.notify?.(msg, "warning");
+			} catch {}
+		};
+		for (const ev of ["session_start", "turn_start", "agent_start"]) {
+			try {
+				(pi as any).on(ev, warn);
+			} catch {}
+		}
+	}
 }
 
 /** Track live context + working status from extension events. */
@@ -323,11 +355,17 @@ function wireEvents(pi: ExtensionAPI) {
 
 /** User messages: compact, italic, thin theme-colored left bar. */
 function patchUserMessages() {
-	const proto = UserMessageComponent.prototype as any;
+	const proto = UserMessageComponent?.prototype as any;
+	if (!proto) return guard("userMessages", false);
 	if (proto.__ampStyle) return;
 	proto.__ampStyle = true;
 
 	const origRebuild = proto.rebuild;
+	const origRender = proto.render;
+	const ok = typeof origRebuild === "function" || typeof origRender === "function";
+	guard("userMessages", ok);
+	if (!ok) return;
+
 	if (typeof origRebuild === "function") {
 		proto.rebuild = function () {
 			origRebuild.call(this);
@@ -344,7 +382,6 @@ function patchUserMessages() {
 		};
 	}
 
-	const origRender = proto.render;
 	if (typeof origRender === "function") {
 		proto.render = function (width: number) {
 			// 3 cols narrower: 2 for the bar prefix + 1 slack so lines never hit
@@ -360,12 +397,13 @@ function patchUserMessages() {
 /** Assistant messages: no leading blank line; thinking blocks dropped while
  *  hidden (ctrl+t restores them — the unfiltered message is kept). */
 function patchAssistantMessages() {
-	const proto = AssistantMessageComponent.prototype as any;
+	const proto = AssistantMessageComponent?.prototype as any;
+	if (!proto) return guard("assistantMessages", false);
 	if (proto.__ampStyle) return;
 	proto.__ampStyle = true;
 
 	const origUpdate = proto.updateContent;
-	if (typeof origUpdate !== "function") return;
+	if (typeof origUpdate !== "function") return guard("assistantMessages", false);
 	proto.updateContent = function (message: any) {
 		let m = message;
 		if (this.hideThinkingBlock && Array.isArray(m?.content) && m.content.some((c: any) => c?.type === "thinking")) {
@@ -383,12 +421,13 @@ function patchAssistantMessages() {
 
 /** Tool calls: Amp-style one-line cards when collapsed; ctrl+o expands. */
 function patchToolCards() {
-	const proto = ToolExecutionComponent.prototype as any;
+	const proto = ToolExecutionComponent?.prototype as any;
+	if (!proto) return guard("toolCards", false);
 	if (proto.__ampStyle) return;
 	proto.__ampStyle = true;
 
 	const origRender = proto.render;
-	if (typeof origRender !== "function") return;
+	if (typeof origRender !== "function") return guard("toolCards", false);
 	proto.render = function (width: number) {
 		if (this.expanded || this.hideComponent) return origRender.call(this, width);
 
@@ -428,39 +467,67 @@ function patchToolCards() {
 		const iconPlain = this.isPartial ? spinFrame : err ? "✗" : "✓";
 		const budget = Math.max(10, width - 1 - colWidth(`${iconPlain} ${statsPlain} ▸`));
 		const shownText = colWidth(text) > budget ? truncCols(text, budget) : text;
-		return ["", `${icon} ${shownText}${stats} ${DIM}▸${UNDIM}`];
+		return ["", `${icon} ${shownText}${stats} ${DIM}▸${UNDIM}${CARD_MARK}`];
 	};
 }
 
 /** Merge adjacent tool cards across component boundaries (TUI-level pass). */
 function patchCardGrouping() {
 	const proto = TUI?.prototype as any;
-	if (!proto || proto.__ampStyle) return;
+	if (!proto) return guard("cardGrouping", false);
+	if (proto.__ampStyle) return;
 	proto.__ampStyle = true;
 
 	const origRender = proto.render;
-	if (typeof origRender !== "function") return;
+	if (typeof origRender !== "function") return guard("cardGrouping", false);
 	proto.render = function (width: number) {
 		return mergeToolCards(origRender.call(this, width));
 	};
 }
 
-/** Hide the native footer and the stock `Working...` spinner line — their info
- *  lives in the editor border. Retry/compaction loaders stay visible. */
+/** Stock footer is always `[pwd, stats, ...extensionStatuses]`. Drop the two
+ *  stock lines (path/model/context already live in the editor border) and keep
+ *  extension status lines from `ctx.ui.setStatus`. If the shape doesn't match,
+ *  blank the footer rather than showing a duplicated stock line. */
+function filterFooterLines(lines: string[]): string[] {
+	if (lines.length < 2) return [];
+	const pwd = stripAnsi(lines[0]).trim();
+	const stats = stripAnsi(lines[1]).trim();
+	const pwdOk = /^(~|\/|[A-Za-z]:)/.test(pwd) || pwd.includes(" • ");
+	// Context window marker like `8.6%/128k` or `?/128k`, with optional token/cost stats.
+	const statsOk = /(?:\d+(?:\.\d+)?%|\?)\/\S+/.test(stats);
+	if (!pwdOk || !statsOk) return [];
+	return lines.slice(2);
+}
+
+/** Hide stock footer chrome and the stock `Working...` spinner line — their
+ *  info lives in the editor border. Extension status lines and retry/compaction
+ *  loaders stay visible. */
 function patchChrome() {
 	const footProto = FooterComponent?.prototype as any;
-	if (footProto && !footProto.__ampStyle) {
+	if (!footProto) {
+		guard("footer", false);
+	} else if (!footProto.__ampStyle) {
 		footProto.__ampStyle = true;
-		footProto.render = function () {
-			return [];
-		};
+		const origRender = footProto.render;
+		if (typeof origRender !== "function") {
+			guard("footer", false);
+		} else {
+			footProto.render = function (width: number) {
+				return filterFooterLines(origRender.call(this, width));
+			};
+		}
 	}
 
 	const loaderProto = Loader?.prototype as any;
-	if (loaderProto && !loaderProto.__ampStyle) {
+	if (!loaderProto) {
+		guard("loader", false);
+	} else if (!loaderProto.__ampStyle) {
 		loaderProto.__ampStyle = true;
 		const origRender = loaderProto.render;
-		if (typeof origRender === "function") {
+		if (typeof origRender !== "function") {
+			guard("loader", false);
+		} else {
 			loaderProto.render = function (width: number) {
 				// Keep the 2-line height of the visible loader — collapsing to zero
 				// lines makes the layout flap while working and leaves ghosts.
@@ -473,12 +540,13 @@ function patchChrome() {
 
 /** Editor: Amp-style rounded box with live info in the borders. */
 function patchEditor() {
-	const proto = CustomEditor.prototype as any;
+	const proto = CustomEditor?.prototype as any;
+	if (!proto) return guard("editor", false);
 	if (proto.__ampStyle) return;
 	proto.__ampStyle = true;
 
 	const baseRender = proto.render; // inherited from pi-tui Editor
-	if (typeof baseRender !== "function") return;
+	if (typeof baseRender !== "function") return guard("editor", false);
 	proto.render = function (width: number) {
 		if (width < 24) return baseRender.call(this, width);
 		const lines: string[] = baseRender.call(this, width - 2);
