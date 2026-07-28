@@ -1,0 +1,27 @@
+{
+  "name": "amp-pi-style",
+  "version": "0.1.0",
+  "description": "Amp-inspired look for the pi coding agent: flat theme, compact spacing, italic user messages with an accent bar",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "themes": [
+      "./themes"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xuzai9964/amp-pi-style"
+  },
+  "license": "MIT",
+  "author": "xuzai9964"
+}
