@@ -2,6 +2,8 @@
 
 Amp-inspired look & feel for the [pi coding agent](https://github.com/earendil-works/pi): flat, calm, compact.
 
+See [DESIGN_LANGUAGE.md](./DESIGN_LANGUAGE.md) for a detailed Chinese-language distillation of Amp CLI's visual and interaction design system.
+
 ## What you get
 
 **Transcript**

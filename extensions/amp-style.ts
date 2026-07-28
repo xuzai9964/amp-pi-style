@@ -446,12 +446,15 @@ function patchToolCards() {
 		else if (path) text = `${name} ${path}`;
 		else if (typeof a.description === "string") text = `${name} ${a.description.split("\n")[0]}`;
 
-		// Diff stats for edit-type tools, counted from the tool's text output.
+		// Diff stats for edit-type tools. Pi's built-in edit keeps its display diff
+		// in result.details.diff; text output is only a success sentence. Fall back
+		// to text for compatible custom edit tools that return a unified diff.
 		let stats = "";
 		let statsPlain = "";
 		if (EDIT_TOOLS.has(name)) {
 			try {
-				const out: string = this.getTextOutput?.() ?? "";
+				const resultDiff = this.result?.details?.diff;
+				const out: string = typeof resultDiff === "string" ? resultDiff : (this.getTextOutput?.() ?? "");
 				let add = 0;
 				let del = 0;
 				for (const line of out.split("\n")) {
