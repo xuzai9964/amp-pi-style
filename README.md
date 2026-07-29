@@ -56,6 +56,7 @@ The renderer uses Pi TUI's ANSI-, grapheme-, emoji-, and CJK-aware width primiti
 - Narrow cards drop diff statistics before shortening the action and target.
 - Grouping begins at 16 columns. Narrower views keep the already bounded individual cards instead.
 - Grouped failures retain the failure symbol, action count, failed count, and expansion affordance before less important statistics.
+- Composer box lines and the steering rail also keep one slack column so Ghostty/iTerm never auto-wrap a full-width row into the next border.
 - Composer metadata removes separators and low-priority labels before sacrificing the current activity.
 - Below 24 columns, the editor safely falls back to Pi's stock renderer.
 - Leading OSC 133 sequences remain at the start of prefixed and rebuilt lines for Ghostty, iTerm2, and other semantic-prompt terminals.

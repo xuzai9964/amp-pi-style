@@ -12,6 +12,8 @@
  *
  * Editor
  * - Rounded box; border color tracks thinking level and bash mode.
+ * - Box lines keep one column of slack so they never hit the exact terminal
+ *   width (Ghostty/iTerm auto-wrap would otherwise collide with the next row).
  * - Top border: live cost/model/context/level metadata drops whole low-priority
  *   labels as width tightens, never leaving ambiguous tail fragments.
  * - Bottom border: the single home for animated, semantic work activity and a
@@ -359,7 +361,9 @@ function decoratePendingSteer(lines: string[], width: number): string[] {
 	const messages = steerRows.map((i) => stripAnsi(lines[i]).trim().slice("Steering: ".length).trim());
 	const latest = messages[messages.length - 1] ?? "";
 	const summary = messages.length > 1 ? `${messages.length} steering · ${latest}` : latest;
-	const railWidth = width - 2; // one-column inset on both sides, like the reference
+	// Inset one column on each side, plus one slack column so the rail never
+	// lands on the exact terminal width (same hard-wrap guard as the composer).
+	const railWidth = Math.max(8, width - 3);
 	const fullHint = "Enter to steer";
 	const hintWidth = colWidth(fullHint);
 	const withHintBudget = railWidth - hintWidth - 5;
@@ -802,7 +806,11 @@ function patchEditor() {
 	};
 	proto.render = function (width: number) {
 		if (width < 24) return markComposer(this, baseRender.call(this, width));
-		const lines: string[] = baseRender.call(this, width - 2);
+		// 2 side borders + 1 slack column. Hitting the exact terminal width makes
+		// Ghostty/iTerm auto-wrap the final cell onto the next row, so the bottom
+		// border and cursor line collide with wrapped composer text.
+		const boxWidth = width - 1;
+		const lines: string[] = baseRender.call(this, boxWidth - 2);
 		if (lines.length < 2) return markComposer(this, lines);
 
 		const bc = typeof this.borderColor === "function" ? this.borderColor : (s: string) => s;
@@ -820,14 +828,14 @@ function patchEditor() {
 
 		const scrollInfo = (line: string) => stripAnsi(line).match(/[↑↓] \d+ more/)?.[0] ?? "";
 
-		/** Corner + low-volume labels + fill + corner, always exactly `width`
+		/** Corner + low-volume labels + fill + corner, always exactly `boxWidth`
 		 *  columns. Right-side metadata yields before the current activity. */
 		const makeBorder = (leftCorner: string, rightCorner: string, origLine: string, leftLabel = "", rightLabel = "") => {
 			const scroll = scrollInfo(origLine);
 			let left = [scroll, leftLabel].filter(Boolean).join(" · ");
 			let leftPlain = left ? `─ ${left} ` : "";
 			let rightPlain = rightLabel ? ` ${rightLabel} ─` : "";
-			const inner = width - 2;
+			const inner = boxWidth - 2;
 
 			if (colWidth(leftPlain) + colWidth(rightPlain) > inner - 1) {
 				rightLabel = "";
@@ -857,7 +865,7 @@ function patchEditor() {
 			.replace(/-20\d{6,8}$/, "");
 		const pct = contextPercent() ?? "";
 		const level = String(lastCtx?.getThinkingLevel?.() ?? thinkingLevel ?? "");
-		const availableTop = Math.max(0, width - 6 - (scrollInfo(lines[0]) ? colWidth(scrollInfo(lines[0])) + 3 : 0));
+		const availableTop = Math.max(0, boxWidth - 6 - (scrollInfo(lines[0]) ? colWidth(scrollInfo(lines[0])) + 3 : 0));
 		const join = (values: string[], separator: string) => values.filter(Boolean).join(separator);
 		const topCandidates = [
 			join([costLabel, modelName, pct, level], " ─ "),
@@ -873,14 +881,14 @@ function patchEditor() {
 		// Bottom border: current activity owns the left; cwd uses only the
 		// remaining right-side budget and keeps meaningful path endpoints.
 		let status = workPhase ?? "";
-		if (status && workTokens > 0 && width >= 48) {
+		if (status && workTokens > 0 && boxWidth >= 48) {
 			const tok = workTokens >= 1000 ? `${(workTokens / 1000).toFixed(1)}k` : `${workTokens}`;
 			status = `${status} ${tok} tok`;
 		}
 		const frame = BORDER_SPIN[Math.floor(Date.now() / 250) % BORDER_SPIN.length];
 		const activity = status ? `${frame} ${status}` : "";
 		const leftWidth = activity ? colWidth(activity) + 3 : 0;
-		const pathBudget = Math.min(Math.floor(width / 2), Math.max(0, width - 6 - leftWidth));
+		const pathBudget = Math.min(Math.floor(boxWidth / 2), Math.max(0, boxWidth - 6 - leftWidth));
 		const path = pathBudget >= 8 ? displayPath(pathBudget) : "";
 		lines[bottom] = makeBorder("╰", "╯", lines[bottom], activity, path);
 
