@@ -18,8 +18,9 @@
  *   middle-elided cwd. Scroll indicators (`↑ N more`) remain intact.
  * - Queued steering messages become an attached, one-line summary rail with an
  *   `Enter to steer` affordance; multiple messages compress without height jitter.
- * - Experimental `AMP_PI_PIN_COMPOSER=1` bottom-aligns the lower frame when the
- *   transcript is shorter than the terminal; unsupported editor layouts fall back.
+ * - Experimental pinned-composer layout bottom-aligns the lower frame when the
+ *   transcript is short. It defaults on for macOS and `AMP_PI_PIN_COMPOSER`
+ *   explicitly toggles it on or off; unsupported editor layouts fall back.
  * - The stock footer is replaced through `ctx.ui.setFooter`: extension statuses
  *   remain dimmed, except hidden redundant keys such as `cursor`.
  * - The stock `Working...` row is blanked but keeps its fixed height and repaint
@@ -71,8 +72,12 @@ const QUEUE_MARKS = [STEER_MARK, FOLLOW_UP_MARK, QUEUE_HINT_MARK];
 const COMPOSER_MARK = "\x1b]777;amp-pi-style;composer\x07";
 const FRAME_MARKS = [CARD_MARK, ...QUEUE_MARKS, COMPOSER_MARK];
 /** Experimental because pi-tui is an inline renderer without an official
- *  bottom-aligned layout primitive. Disabled unless explicitly requested. */
-const PIN_COMPOSER = /^(?:1|true|yes|on)$/i.test(process.env.AMP_PI_PIN_COMPOSER ?? "");
+ *  bottom-aligned layout primitive. macOS defaults on; the environment variable
+ *  remains an explicit cross-platform override. */
+const PIN_COMPOSER_ENV = process.env.AMP_PI_PIN_COMPOSER?.trim();
+const PIN_COMPOSER = PIN_COMPOSER_ENV
+	? /^(?:1|true|yes|on)$/i.test(PIN_COMPOSER_ENV)
+	: process.platform === "darwin";
 
 /** Leading OSC sequences (e.g. OSC 133 semantic-prompt marks) that must stay at
  *  the very start of a line — semantic-prompt terminals (Ghostty, iTerm2) break

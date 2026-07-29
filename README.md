@@ -38,7 +38,7 @@ See [DESIGN_LANGUAGE.md](./DESIGN_LANGUAGE.md) for the detailed Chinese-language
 - Queued steering becomes an attached rounded rail above the composer: the latest instruction stays visible, multiple queued messages compress to a count, and `Enter to steer` keeps the interaction discoverable.
 - The cwd keeps its origin and meaningful tail with middle elision, for example `~/Library/…/project/src`.
 - Scroll indicators such as `↑ 4 more` and `↓ 2 more` remain intact.
-- Experimental pinned-composer mode keeps the lower frame at the terminal bottom while a short transcript grows upward.
+- Experimental pinned-composer mode keeps the lower frame at the terminal bottom while a short transcript grows upward; it defaults on for macOS and remains environment-toggleable.
 - Pi's stock `Working...` row becomes visually blank but retains its fixed height and animation timer, preventing layout movement while keeping border animation alive. Retry and compaction notices remain visible.
 
 **Quiet semantic themes**
@@ -79,13 +79,14 @@ Then configure `~/.pi/agent/settings.json`, or use `/settings` in Pi:
 
 ### Experimental pinned composer
 
-Launch Pi with the opt-in environment variable:
+Pinned composer defaults on for macOS and off on other platforms. Override either default before launching Pi:
 
 ```bash
-AMP_PI_PIN_COMPOSER=1 pi
+AMP_PI_PIN_COMPOSER=1 pi  # enable
+AMP_PI_PIN_COMPOSER=0 pi  # disable
 ```
 
-When the rendered session is shorter than the terminal, the extension inserts flexible blank rows immediately before the active composer. Those rows yield as transcript content grows, so new content pushes upward while the lower frame stays at the bottom. Once content exceeds the terminal height, Pi's normal bottom viewport takes over.
+The toggle also accepts `true`/`false`, `yes`/`no`, and `on`/`off` (case-insensitive). When the rendered session is shorter than the terminal, the extension inserts flexible blank rows immediately before the active composer. Those rows yield as transcript content grows, so new content pushes upward while the lower frame stays at the bottom. Once content exceeds the terminal height, Pi's normal bottom viewport takes over.
 
 This is experimental because Pi currently exposes no official bottom-aligned layout primitive and its TUI renders inline in the terminal. Starting the mode can push the preceding shell prompt into scrollback. Unsupported or replaced editor layouts safely retain Pi's normal top-flow behavior. Set the variable before starting Pi; changing it requires a restart.
 
@@ -107,7 +108,7 @@ The working loader remains a prototype patch by design. Calling `setWorkingVisib
 
 Live model, thinking, context, and cost values come from the extension context at render time. Collapsed cards carry an invisible marker, so the final transcript pass never merges lookalike assistant text. That same bounded pass recognizes Pi's own queued-steering rows and turns them into the attached rail without changing queue behavior.
 
-With `AMP_PI_PIN_COMPOSER=1`, the editor emits a separate invisible boundary marker. The final-frame pass requires exactly one such marker before padding to the current terminal height; dialogs, custom editors that bypass Pi's `CustomEditor`, and incompatible internals therefore fall back without guessing.
+When pinned composer is enabled, the editor emits a separate invisible boundary marker. The final-frame pass requires exactly one such marker before padding to the current terminal height; dialogs, custom editors that bypass Pi's `CustomEditor`, and incompatible internals therefore fall back without guessing.
 
 ## Deliberate scope
 
