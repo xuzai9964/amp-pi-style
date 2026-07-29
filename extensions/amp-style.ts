@@ -3,52 +3,48 @@
  *
  * Transcript
  * - User messages: no vertical padding, italic, thin theme-colored `▎` bar on the left.
- * - Assistant messages: no leading blank line — exactly one blank line between blocks.
- * - Thinking: removed from the transcript while `hideThinkingBlock` is on (live status
- *   is in the editor border instead); ctrl+t still restores the full thinking view.
- * - Tool calls: collapsed to Amp-style one-liners — `✓ Edited path +5 -1 ▸`,
- *   `✗ $ cmd ▸`, animated `∴` while running; ctrl+o expands to the full renderer.
- *   Consecutive command/read cards merge: `✗ Ran 15 commands, 2 failed ▸`.
- *   Collapsed cards carry an invisible marker so grouping only merges our cards.
+ * - Assistant messages: no leading blank line, exactly one blank line between blocks.
+ * - Thinking: removed while `hideThinkingBlock` is on; ctrl+t restores the full view.
+ * - Tool calls: semantic one-line summaries such as `✓ Searched query ▸`,
+ *   `✓ Edited path +5 -1 ▸`, and `✗ $ cmd ▸`; ctrl+o keeps full details reachable.
+ * - Adjacent command/search/read/edit cards become bounded work summaries. An
+ *   invisible marker prevents grouping unrelated transcript text.
  *
  * Editor
- * - Rounded box; border color still tracks thinking level / bash mode.
- * - Top border right: `$cost ─ model ─ ctx% ─ level` (all live values).
- * - Bottom border: animated `≈ Thinking 13 tok` on the left while working,
- *   abbreviated cwd on the right. Scroll indicators (`↑ N more`) are preserved.
- * - `∴ Running bash · read` widget line above the box while tools execute.
- * - The stock footer is replaced via the official `ctx.ui.setFooter` API:
- *   only extension status lines (`ctx.ui.setStatus`) remain, dimmed, minus a
- *   small hidden-key list (`cursor` — redundant with the border's model) —
- *   path/model/context live in the editor border. The stock `Working...` spinner is
- *   blanked (prototype patch, kept deliberately: its animation timer drives
- *   the border-spinner repaints). Retry/compaction loaders stay visible.
+ * - Rounded box; border color tracks thinking level and bash mode.
+ * - Top border: live cost/model/context/level metadata drops whole low-priority
+ *   labels as width tightens, never leaving ambiguous tail fragments.
+ * - Bottom border: the single home for animated, semantic work activity and a
+ *   middle-elided cwd. Scroll indicators (`↑ N more`) remain intact.
+ * - Queued steering messages become an attached, one-line summary rail with an
+ *   `Enter to steer` affordance; multiple messages compress without height jitter.
+ * - The stock footer is replaced through `ctx.ui.setFooter`: extension statuses
+ *   remain dimmed, except hidden redundant keys such as `cursor`.
+ * - The stock `Working...` row is blanked but keeps its fixed height and repaint
+ *   timer. Retry and compaction loaders remain visible.
  *
- * Implementation: official extension APIs where pi provides them (footer,
- * widgets); prototype patches applied at load time for the rest. Every patch
- * is guarded — if a future pi version renames these internals, patches degrade
- * to no-ops instead of crashing, and a one-time load notice names the failed
- * patches. Live data (model, thinking level, context, cost) is read through
- * the extension context's stable getters at render time, never cached from
- * event snapshots.
+ * Implementation: official APIs where available, guarded prototype patches for
+ * the remaining surfaces. Width and truncation use pi-tui's ANSI/grapheme-safe
+ * primitives; leading OSC semantic-prompt marks stay at byte zero. Missing or
+ * renamed internals fall back safely and produce one diagnostic notice.
  */
 import {
 	AssistantMessageComponent,
 	CustomEditor,
+	InteractiveMode,
 	ToolExecutionComponent,
 	UserMessageComponent,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { Loader, TUI, truncateToWidth } from "@earendil-works/pi-tui";
+import * as PiTui from "@earendil-works/pi-tui";
+
+const { Loader, TUI, TruncatedText, truncateToWidth } = PiTui as any;
+const visibleWidthSafe = (PiTui as any).visibleWidth as ((text: string) => number) | undefined;
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 // ── constants ────────────────────────────────────────────────────────────────
 
 const BAR = "▎";
-const DIM = "\x1b[2m";
-const UNDIM = "\x1b[22m";
-const GREEN = "\x1b[32m";
-const RED = "\x1b[31m";
-const RESETFG = "\x1b[39m";
 
 /** Bottom-border wave while the agent works (repaints ride the stock loader timer). */
 const BORDER_SPIN = ["~", "≈", "≋", "≈"];
@@ -59,11 +55,17 @@ const TOOL_SPIN = ["∴", "∵", "∷", "∵"];
 const EDIT_TOOLS = new Set(["edit", "write", "cursor", "apply_patch", "multiedit"]);
 
 /** Collapsed tool-card line, used for grouping. Excludes the running `∴` state. */
-const CARD_RE = /^([✓✗]) (\$ |Read |Edited |Wrote )/;
+const CARD_RE = /^([✓✗]) (\$ |Read |Searched |Edited |Wrote )/;
 /** Diff stats at the end of an edit card: `+5 -1 ▸`. */
 const CARD_STATS_RE = /\+(\d+) -(\d+) ▸\s*$/;
-/** Invisible marker appended to our collapsed cards so grouping ignores lookalikes. */
-const CARD_MARK = "\u200b";
+/** Zero-width markers scope final-frame transforms to rows created by this
+ *  extension or by Pi's own queued-message renderer. */
+const CARD_MARK = "\x1b]777;amp-pi-style;card\x07";
+const STEER_MARK = "\x1b]777;amp-pi-style;steer\x07";
+const FOLLOW_UP_MARK = "\x1b]777;amp-pi-style;follow-up\x07";
+const QUEUE_HINT_MARK = "\x1b]777;amp-pi-style;queue-hint\x07";
+const QUEUE_MARKS = [STEER_MARK, FOLLOW_UP_MARK, QUEUE_HINT_MARK];
+const FRAME_MARKS = [CARD_MARK, ...QUEUE_MARKS];
 
 /** Leading OSC sequences (e.g. OSC 133 semantic-prompt marks) that must stay at
  *  the very start of a line — semantic-prompt terminals (Ghostty, iTerm2) break
@@ -73,44 +75,59 @@ const LEADING_OSC_RE = /^(?:\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))+/;
 // ── live session state (fed by extension events, read at render time) ────────
 
 let lastCtx: any = null;
+let activeTheme: any = null;
 let thinkingLevel: string | null = null;
 let workPhase: string | null = null;
 let workTokens = 0;
 let activeTools = 0;
+let framePassReady = false;
 let costCache = { entryCount: -1, value: 0 };
 let ctxUsageCache = { at: 0, value: null as any };
 const failedPatches: string[] = [];
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replaceAll(CARD_MARK, "");
+const stripAnsi = (s: string): string =>
+	FRAME_MARKS.reduce((text, marker) => text.replaceAll(marker, ""), s)
+		.replace(LEADING_OSC_RE, "")
+		.replace(/\x1b\[[0-9;]*m/g, "");
 
 /** Record a failed prototype patch once at load (never per-render). */
 function guard(name: string, ok: boolean) {
 	if (!ok) failedPatches.push(name);
 }
 
-/** Visible column width, counting CJK as 2 columns. Zero-width marks count 0. */
+/** Visible terminal columns using pi-tui's ANSI-, grapheme-, emoji-, and CJK-safe primitive. */
 function colWidth(s: string): number {
-	let w = 0;
-	for (const ch of s) {
-		if (ch === CARD_MARK || ch === "\uFEFF") continue;
-		w += /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]/.test(ch) ? 2 : 1;
-	}
-	return w;
+	const clean = FRAME_MARKS.reduce((text, marker) => text.replaceAll(marker, ""), s).replaceAll("\uFEFF", "");
+	if (visibleWidthSafe) return visibleWidthSafe(clean);
+	return stripAnsi(clean).length;
 }
 
-/** Truncate to `max` columns, appending `…` when cut. */
-function truncCols(s: string, max: number): string {
-	let w = 0;
+/** Truncate to `max` columns, with or without a visible omission mark. */
+const truncCols = (s: string, max: number): string => truncateToWidth(s, Math.max(0, max), "…");
+const hardTrim = (s: string, max: number): string => truncateToWidth(s, Math.max(0, max), "");
+const tailCols = (s: string, max: number): string => {
 	let out = "";
-	for (const ch of s) {
-		const cw = colWidth(ch);
-		if (w + cw > max) return out + "…";
-		out += ch;
-		w += cw;
+	let width = 0;
+	const segments = [...graphemeSegmenter.segment(s)].map(({ segment }) => segment);
+	for (let i = segments.length - 1; i >= 0; i--) {
+		const next = colWidth(segments[i]);
+		if (width + next > max) break;
+		out = segments[i] + out;
+		width += next;
 	}
 	return out;
+};
+
+/** Apply a semantic theme role. Plain text is the safe pre-context/NO_COLOR fallback. */
+function semantic(role: "accent" | "success" | "error" | "dim" | "text" | "borderMuted", text: string): string {
+	try {
+		const fg = activeTheme?.fg;
+		return typeof fg === "function" ? fg.call(activeTheme, role, text) : text;
+	} catch {
+		return text;
+	}
 }
 
 /** Total session cost, summed from persisted assistant usage. */
@@ -146,17 +163,22 @@ function contextPercent(): string | null {
 /** cwd with $HOME shortened to `~`, middle segments elided to fit `max` columns
  *  (Amp-style: `~/Library/…/PhD/00_thesis`). */
 function displayPath(max: number): string {
+	if (max <= 0) return "";
 	const home = process.env.HOME;
 	const cwd: string = lastCtx?.cwd ?? process.cwd();
 	const p = home && cwd.startsWith(home) ? "~" + cwd.slice(home.length) : cwd;
 	if (colWidth(p) <= max) return p;
 	const seg = p.split("/");
-	// Keep the first segment and as many trailing segments as fit.
+	// Keep the first segment and as many complete trailing segments as fit.
 	for (let keep = seg.length - 2; keep >= 1; keep--) {
 		const cand = `${seg[0]}/…/${seg.slice(seg.length - keep).join("/")}`;
 		if (colWidth(cand) <= max) return cand;
 	}
-	return truncCols(`${seg[0]}/…/${seg[seg.length - 1]}`, max);
+	// Extremely narrow: retain both the path origin and its literal tail.
+	const prefix = p.startsWith("~/") ? "~/" : p.startsWith("/") ? "/" : `${seg[0]}/`;
+	const tailBudget = Math.max(0, max - colWidth(prefix) - 1);
+	if (tailBudget <= 0) return hardTrim(prefix, max);
+	return `${prefix}…${tailCols(p, tailBudget)}`;
 }
 
 /** Insert `text` after any leading OSC marks so they stay at the line start. */
@@ -167,14 +189,57 @@ function afterLeadingOsc(line: string, text: string): string {
 
 // ── tool-card grouping (line-level pass over the final TUI render) ───────────
 
-type CardCat = "cmd" | "read" | "edit";
+type ToolCat = "cmd" | "search" | "read" | "edit" | "other";
+type CardCat = Exclude<ToolCat, "other">;
+
+function toolCategory(name: string): ToolCat {
+	const n = name.toLowerCase();
+	if (["bash", "command", "exec", "run_command", "shell"].includes(n)) return "cmd";
+	if (["grep", "find", "glob", "search", "web_search"].includes(n) || n.startsWith("search_") || n.endsWith("_search")) return "search";
+	if (["read", "fetch", "fetch_content", "fetch_url", "web_fetch"].includes(n)) return "read";
+	if (EDIT_TOOLS.has(n)) return "edit";
+	return "other";
+}
+
+const oneLine = (text: string): string => text.replace(/[\r\n\t]+/g, " ").replace(/ +/g, " ").trim();
+const firstText = (value: any, keys: string[]): string => {
+	for (const key of keys) {
+		if (typeof value?.[key] === "string") {
+			const text = oneLine(value[key]);
+			if (text) return text;
+		}
+	}
+	return "";
+};
+
+function toolSummary(name: string, args: any): string {
+	const cat = toolCategory(name);
+	const path = firstText(args, ["path", "file", "filePath", "url"]);
+	if (cat === "cmd" && typeof args?.command === "string") return `$ ${oneLine(args.command.split(/\r?\n/)[0])}`;
+	if (cat === "search") {
+		const query = firstText(args, ["query", "pattern", "search", "term", "glob"]) || path;
+		return query ? `Searched ${query}` : "Searched";
+	}
+	if (cat === "read" && path) return `Read ${path}`;
+	if (cat === "edit" && path) return `${name.toLowerCase() === "write" ? "Wrote" : "Edited"} ${path}`;
+	if (path) return `${name} ${path}`;
+	const description = firstText(args, ["description"]);
+	return description ? `${name} ${description.split("\n")[0]}` : name.replace(/[_-]+/g, " ");
+}
 
 function cardInfo(line: string | undefined): { icon: string; cat: CardCat; add: number; del: number } | null {
 	if (!line?.includes(CARD_MARK)) return null;
 	const plain = stripAnsi(line);
 	const m = plain.match(CARD_RE);
 	if (!m) return null;
-	const cat: CardCat = m[2].startsWith("$") ? "cmd" : m[2].startsWith("Read") ? "read" : "edit";
+	const prefix = m[2];
+	const cat: CardCat = prefix.startsWith("$")
+		? "cmd"
+		: prefix.startsWith("Read")
+			? "read"
+			: prefix.startsWith("Searched")
+				? "search"
+				: "edit";
 	const s = cat === "edit" ? plain.match(CARD_STATS_RE) : null;
 	return { icon: m[1], cat, add: s ? Number(s[1]) : 0, del: s ? Number(s[2]) : 0 };
 }
@@ -182,7 +247,8 @@ function cardInfo(line: string | undefined): { icon: string; cat: CardCat; add: 
 /** Merge runs of adjacent same-category cards (separated only by blank lines):
  *  `✓ Ran N commands[, M failed] ▸`, `✓ Read N files ▸`,
  *  `✓ Edited N files +ΣA -ΣD ▸` (diff stats aggregated, Amp-style). */
-function mergeToolCards(lines: string[]): string[] {
+function mergeToolCards(lines: string[], width: number): string[] {
+	if (width < 16) return lines;
 	const out: string[] = [];
 	let i = 0;
 	while (i < lines.length) {
@@ -203,16 +269,45 @@ function mergeToolCards(lines: string[]): string[] {
 		if (run.length > 1) {
 			const failed = run.filter((c) => c.icon === "✗").length;
 			const noun =
-				cur.cat === "cmd" ? `Ran ${run.length} commands` : cur.cat === "read" ? `Read ${run.length} files` : `Edited ${run.length} files`;
-			let stats = "";
+				cur.cat === "cmd"
+					? `Ran ${run.length} commands`
+					: cur.cat === "search"
+						? `Ran ${run.length} searches`
+						: cur.cat === "read"
+							? `Read ${run.length} files`
+							: `Edited ${run.length} files`;
+			let statsPlain = "";
 			if (cur.cat === "edit") {
 				const add = run.reduce((n, c) => n + c.add, 0);
 				const del = run.reduce((n, c) => n + c.del, 0);
-				if (add || del) stats = ` ${GREEN}+${add}${RESETFG} ${RED}-${del}${RESETFG}`;
+				if (add || del) statsPlain = ` +${add} -${del}`;
 			}
-			const icon = failed ? `${RED}✗${RESETFG}` : `${GREEN}✓${RESETFG}`;
-			const fail = failed ? `, ${RED}${failed} failed${RESETFG}` : "";
-			out.push(`${icon} ${noun}${fail}${stats} ${DIM}▸${UNDIM}${CARD_MARK}`);
+			const compactNoun =
+				cur.cat === "cmd" ? `Cmd ${run.length}` : cur.cat === "search" ? `Search ${run.length}` : cur.cat === "read" ? `Read ${run.length}` : `Edit ${run.length}`;
+			const categoryMark = cur.cat === "cmd" ? "C" : cur.cat === "search" ? "S" : cur.cat === "read" ? "R" : "E";
+			const candidates = [
+				{ noun, fail: failed ? `, ${failed} failed` : "", stats: statsPlain },
+				{ noun, fail: failed ? `, ${failed} failed` : "", stats: "" },
+				{ noun: compactNoun, fail: failed ? `, ${failed} failed` : "", stats: "" },
+				{ noun: compactNoun, fail: failed ? ` · ${failed} fail` : "", stats: "" },
+				{ noun: `${categoryMark}${run.length}`, fail: failed ? ` F${failed}` : "", stats: "" },
+			];
+			const fits = (part: { noun: string; fail: string; stats: string }) =>
+				colWidth(`✗ ${part.noun}${part.fail}${part.stats} ▸`) <= Math.max(1, width - 1);
+			const chosen = candidates.find(fits);
+			// If even the count-preserving shorthand cannot fit, retain the
+			// already bounded individual cards instead of dropping semantics.
+			if (!chosen) {
+				out.push(lines[i]);
+				i++;
+				continue;
+			}
+			const icon = semantic(failed ? "error" : "success", failed ? "✗" : "✓");
+			const fail = chosen.fail ? semantic("error", chosen.fail) : "";
+			const stats = chosen.stats
+				? ` ${semantic("success", chosen.stats.trim().split(" ")[0])} ${semantic("error", chosen.stats.trim().split(" ")[1])}`
+				: "";
+			out.push(`${icon} ${chosen.noun}${fail}${stats} ${semantic("dim", "▸")}${CARD_MARK}`);
 			i = j + 1;
 		} else {
 			out.push(lines[i]);
@@ -222,18 +317,76 @@ function mergeToolCards(lines: string[]): string[] {
 	return out;
 }
 
+/** Replace Pi's marked queued-steering rows with a stable summary rail. The
+ *  blank status/widget rows move above it, so the rail sits against the next
+ *  visible surface (normally the composer) without changing total height. */
+function decoratePendingSteer(lines: string[], width: number): string[] {
+	const unmarkFrame = (line: string) => FRAME_MARKS.reduce((text, marker) => text.replaceAll(marker, ""), line);
+	const cleanFrameLines = () => lines.map(unmarkFrame);
+	if (width < 24) return cleanFrameLines();
+	let hint = -1;
+	for (let i = lines.length - 1; i >= 0; i--) {
+		if (lines[i].includes(QUEUE_HINT_MARK)) {
+			hint = i;
+			break;
+		}
+	}
+	if (hint < 0) return cleanFrameLines();
+
+	let firstQueued = hint - 1;
+	while (firstQueued >= 0 && (lines[firstQueued].includes(STEER_MARK) || lines[firstQueued].includes(FOLLOW_UP_MARK))) firstQueued--;
+	firstQueued++;
+	const steerRows: number[] = [];
+	const followUpRows: number[] = [];
+	for (let i = firstQueued; i < hint; i++) {
+		if (lines[i].includes(STEER_MARK)) steerRows.push(i);
+		else if (lines[i].includes(FOLLOW_UP_MARK)) followUpRows.push(i);
+	}
+	if (steerRows.length === 0) return cleanFrameLines();
+
+	const messages = steerRows.map((i) => stripAnsi(lines[i]).trim().slice("Steering: ".length).trim());
+	const latest = messages[messages.length - 1] ?? "";
+	const summary = messages.length > 1 ? `${messages.length} steering · ${latest}` : latest;
+	const railWidth = width - 2; // one-column inset on both sides, like the reference
+	const fullHint = "Enter to steer";
+	const hintWidth = colWidth(fullHint);
+	const withHintBudget = railWidth - hintWidth - 5;
+	const showHint = withHintBudget >= 8;
+	const messageBudget = showHint ? withHintBudget : railWidth - 4;
+	const shown = colWidth(summary) > messageBudget ? truncCols(summary, messageBudget) : summary;
+	const hintStyled = showHint ? `${semantic("accent", "Enter")}${semantic("dim", " to steer")}` : "";
+	const gap = " ".repeat(Math.max(showHint ? 1 : 0, railWidth - 4 - colWidth(shown) - (showHint ? hintWidth : 0)));
+	const border = (left: string, rightCorner: string) => ` ${semantic("borderMuted", left + "─".repeat(railWidth - 2) + rightCorner)} `;
+	const content = ` ${semantic("borderMuted", "│")} ${semantic("text", shown)}${gap}${hintStyled} ${semantic("borderMuted", "│")} `;
+
+	let start = firstQueued;
+	if (start > 0 && stripAnsi(lines[start - 1]).trim() === "") start--;
+	let after = hint + 1;
+	while (after < lines.length && stripAnsi(lines[after]).trim() === "") after++;
+	// When the next visible line is the composer's rounded top border, let that
+	// wider edge close the inset rail. Otherwise give the rail its own bottom.
+	const attached = after < lines.length && stripAnsi(lines[after]).trimStart().startsWith("╭");
+	const rail = attached ? [border("╭", "╮"), content] : [border("╭", "╮"), content, border("╰", "╯")];
+	const secondary = followUpRows.length > 0 ? [...followUpRows.map((i) => unmarkFrame(lines[i])), unmarkFrame(lines[hint])] : [];
+	const replacedHeight = hint - start + 1 + (after - hint - 1);
+	const preservedBlanks = Math.max(0, replacedHeight - secondary.length - rail.length);
+	return [...lines.slice(0, start), ...secondary, ...Array(preservedBlanks).fill(""), ...rail, ...lines.slice(after)].map(unmarkFrame);
+}
+
 // ── extension entry ──────────────────────────────────────────────────────────
 
 export default function ampStyle(pi: ExtensionAPI) {
+	guard("unicodeWidth", typeof visibleWidthSafe === "function");
 	wireEvents(pi);
 	patchUserMessages();
 	patchAssistantMessages();
 	patchToolCards();
 	patchCardGrouping();
+	patchPendingMessages();
 	patchChrome();
 	patchEditor();
 	if (failedPatches.length) {
-		const msg = `amp-pi-style: degraded patches: ${failedPatches.join(", ")} — stock UI until package is updated`;
+		const msg = `amp-pi-style: degraded enhancements: ${failedPatches.join(", ")} — safe or stock fallbacks active`;
 		console.error(msg);
 		let notified = false;
 		const warn = (_event: any, ctx: any) => {
@@ -269,11 +422,13 @@ function wireEvents(pi: ExtensionAPI) {
 		thinkingLevel = event?.level ?? thinkingLevel;
 	});
 
+	const activeToolNames = new Map<string, string>();
 	on("agent_start", (e, ctx) => {
 		track(e, ctx);
 		workPhase = "Working";
 		workTokens = 0;
 		activeTools = 0;
+		activeToolNames.clear();
 	});
 	on("message_update", (event, ctx) => {
 		track(event, ctx);
@@ -291,17 +446,8 @@ function wireEvents(pi: ExtensionAPI) {
 		}
 	});
 
-	// Amp-style activity line above the editor while tools execute:
-	// `∴ Exploring 1 search`, `∴ Running 2 commands`, `∴ Editing 1 file`...
-	const activeToolNames = new Map<string, string>();
-	const toolCategory = (name: string): string => {
-		const n = name.toLowerCase();
-		if (n === "bash" || n.includes("command") || n.includes("exec")) return "cmd";
-		if (n.includes("grep") || n.includes("find") || n.includes("glob") || n.includes("search")) return "search";
-		if (n === "read" || n.includes("fetch")) return "read";
-		if (EDIT_TOOLS.has(n)) return "edit";
-		return "other";
-	};
+	// Detailed tool activity has one stable home in the editor's bottom border:
+	// `≈ Exploring 1 search`, `≈ Running 2 commands`, `≈ Editing 1 file`...
 	const activityPhrase = (names: string[]): string => {
 		const n = names.length;
 		const cats = new Set(names.map(toolCategory));
@@ -317,33 +463,24 @@ function wireEvents(pi: ExtensionAPI) {
 			case "edit":
 				return `Editing ${plural("file")}`;
 			default:
-				return n === 1 ? `Running ${names[0]}` : `Running ${n} tools`;
+				return n === 1 ? "Running 1 tool" : `Running ${n} tools`;
 		}
 	};
-	const updateToolWidget = (ctx: any) => {
-		try {
-			if (!ctx?.hasUI) return;
-			const names = [...activeToolNames.values()];
-			ctx.ui.setWidget("amp-style-tools", names.length ? [`${DIM}∴ ${activityPhrase(names)}${UNDIM}`] : []);
-		} catch {}
-	};
-	on("tool_execution_start", (event, ctx) => {
-		activeTools++;
-		workPhase = activeTools > 1 ? `Running ${activeTools} tools` : "Running tools";
-		const id = event?.toolCallId ?? event?.id ?? `t${activeTools}`;
+	on("tool_execution_start", (event, _ctx) => {
+		const id = event?.toolCallId ?? event?.id ?? `t${activeToolNames.size + 1}`;
 		activeToolNames.set(String(id), event?.toolName ?? event?.name ?? "tool");
-		updateToolWidget(ctx);
+		activeTools = activeToolNames.size;
+		workPhase = activityPhrase([...activeToolNames.values()]);
 	});
-	on("tool_execution_end", (event, ctx) => {
-		activeTools = Math.max(0, activeTools - 1);
-		if (activeTools === 0) {
-			workPhase = "Working";
-			activeToolNames.clear();
-		} else {
-			const id = event?.toolCallId ?? event?.id;
-			if (id != null) activeToolNames.delete(String(id));
+	on("tool_execution_end", (event, _ctx) => {
+		const id = event?.toolCallId ?? event?.id;
+		if (id != null) activeToolNames.delete(String(id));
+		else {
+			const first = activeToolNames.keys().next().value;
+			if (first !== undefined) activeToolNames.delete(first);
 		}
-		updateToolWidget(ctx);
+		activeTools = activeToolNames.size;
+		workPhase = activeTools === 0 ? "Working" : activityPhrase([...activeToolNames.values()]);
 	});
 	on("agent_end", (e, ctx) => {
 		track(e, ctx);
@@ -351,7 +488,6 @@ function wireEvents(pi: ExtensionAPI) {
 		workTokens = 0;
 		activeTools = 0;
 		activeToolNames.clear();
-		updateToolWidget(ctx);
 		costCache.entryCount = -1;
 		ctxUsageCache.at = 0;
 	});
@@ -388,9 +524,10 @@ function patchUserMessages() {
 
 	if (typeof origRender === "function") {
 		proto.render = function (width: number) {
+			if (width < 3) return origRender.call(this, width);
 			// 3 cols narrower: 2 for the bar prefix + 1 slack so lines never hit
 			// the exact terminal width (avoids hard-wrap artifacts).
-			const lines = origRender.call(this, Math.max(20, width - 3));
+			const lines = origRender.call(this, width - 3);
 			const colorFn = this.children?.[0]?.children?.[0]?.defaultTextStyle?.color;
 			const bar = (typeof colorFn === "function" ? colorFn(BAR) : BAR) + " ";
 			return lines.map((line: string) => afterLeadingOsc(line, bar));
@@ -433,25 +570,18 @@ function patchToolCards() {
 	const origRender = proto.render;
 	if (typeof origRender !== "function") return guard("toolCards", false);
 	proto.render = function (width: number) {
-		if (this.expanded || this.hideComponent) return origRender.call(this, width);
+		if (this.expanded || this.hideComponent || width < 8) return origRender.call(this, width);
 
 		const name = String(this.toolName ?? "tool");
 		const a = this.args ?? {};
-		const path =
-			typeof a.path === "string" ? a.path : typeof a.file === "string" ? a.file : typeof a.filePath === "string" ? a.filePath : "";
-		let text = name;
-		if (typeof a.command === "string") text = `$ ${a.command.split("\n")[0]}`;
-		else if (name === "read" && path) text = `Read ${path}`;
-		else if (EDIT_TOOLS.has(name) && path) text = `${name === "write" ? "Wrote" : "Edited"} ${path}`;
-		else if (path) text = `${name} ${path}`;
-		else if (typeof a.description === "string") text = `${name} ${a.description.split("\n")[0]}`;
+		const text = toolSummary(name, a);
 
 		// Diff stats for edit-type tools. Pi's built-in edit keeps its display diff
 		// in result.details.diff; text output is only a success sentence. Fall back
 		// to text for compatible custom edit tools that return a unified diff.
 		let stats = "";
 		let statsPlain = "";
-		if (EDIT_TOOLS.has(name)) {
+		if (EDIT_TOOLS.has(name.toLowerCase())) {
 			try {
 				const resultDiff = this.result?.details?.diff;
 				const out: string = typeof resultDiff === "string" ? resultDiff : (this.getTextOutput?.() ?? "");
@@ -462,7 +592,7 @@ function patchToolCards() {
 					else if (line.startsWith("-") && !line.startsWith("---")) del++;
 				}
 				if (add || del) {
-					stats = ` ${GREEN}+${add}${RESETFG} ${RED}-${del}${RESETFG}`;
+					stats = ` ${semantic("success", `+${add}`)} ${semantic("error", `-${del}`)}`;
 					statsPlain = ` +${add} -${del}`;
 				}
 			} catch {}
@@ -470,26 +600,79 @@ function patchToolCards() {
 
 		const err = this.result?.isError === true;
 		const spinFrame = TOOL_SPIN[Math.floor(Date.now() / 280) % TOOL_SPIN.length];
-		const icon = this.isPartial ? `${GREEN}${spinFrame}${RESETFG}` : err ? `${RED}✗${RESETFG}` : `${GREEN}✓${RESETFG}`;
 		const iconPlain = this.isPartial ? spinFrame : err ? "✗" : "✓";
-		const budget = Math.max(10, width - 1 - colWidth(`${iconPlain} ${statsPlain} ▸`));
+		const icon = semantic(this.isPartial ? "accent" : err ? "error" : "success", iconPlain);
+		// Impact statistics yield before the primary action or target is shortened.
+		if (statsPlain && colWidth(text) + colWidth(statsPlain) + 4 > width - 1) {
+			stats = "";
+			statsPlain = "";
+		}
+		const budget = Math.max(1, width - 5 - colWidth(statsPlain));
 		const shownText = colWidth(text) > budget ? truncCols(text, budget) : text;
-		return ["", `${icon} ${shownText}${stats} ${DIM}▸${UNDIM}${CARD_MARK}`];
+		const marker = framePassReady ? CARD_MARK : "";
+		return ["", `${icon} ${shownText}${stats} ${semantic("dim", "▸")}${marker}`];
 	};
 }
 
-/** Merge adjacent tool cards across component boundaries (TUI-level pass). */
+/** Mark only children owned by Pi's pending-message container before they
+ *  enter the final frame. Custom TruncatedText widgets never receive a marker. */
+function patchPendingMessages() {
+	const modeProto = InteractiveMode?.prototype as any;
+	const textProto = TruncatedText?.prototype as any;
+	if (!modeProto || !textProto) return guard("pendingMessages", false);
+
+	if (!modeProto.__ampStylePending) {
+		const origUpdate = modeProto.updatePendingMessagesDisplay;
+		if (typeof origUpdate !== "function") return guard("pendingMessages", false);
+		modeProto.__ampStyle = true;
+		modeProto.__ampStylePending = true;
+		modeProto.updatePendingMessagesDisplay = function (...args: any[]) {
+			const result = origUpdate.apply(this, args);
+			for (const child of this.pendingMessagesContainer?.children ?? []) {
+				if (!(child instanceof TruncatedText)) continue;
+				const text = stripAnsi(String(child.text ?? "")).trim();
+				child.__ampQueueMarker = text.startsWith("Steering: ")
+					? STEER_MARK
+					: text.startsWith("Follow-up: ")
+						? FOLLOW_UP_MARK
+						: /^↳ .+ to edit all queued messages$/.test(text)
+							? QUEUE_HINT_MARK
+							: "";
+			}
+			return result;
+		};
+	}
+
+	if (!textProto.__ampStylePending) {
+		const origRender = textProto.render;
+		if (typeof origRender !== "function") return guard("pendingMessages", false);
+		textProto.__ampStyle = true;
+		textProto.__ampStylePending = true;
+		textProto.render = function (width: number) {
+			const lines: string[] = origRender.call(this, width);
+			const marker = framePassReady ? String(this.__ampQueueMarker ?? "") : "";
+			return marker && lines.length === 1 ? [lines[0] + marker] : lines;
+		};
+	}
+}
+
+/** Final TUI pass: merge adjacent tool cards and frame queued steering. */
 function patchCardGrouping() {
 	const proto = TUI?.prototype as any;
 	if (!proto) return guard("cardGrouping", false);
-	if (proto.__ampStyle) return;
-	proto.__ampStyle = true;
+	if (proto.__ampStyleFrame2) {
+		framePassReady = true;
+		return;
+	}
 
 	const origRender = proto.render;
 	if (typeof origRender !== "function") return guard("cardGrouping", false);
+	proto.__ampStyle = true;
+	proto.__ampStyleFrame2 = true;
 	proto.render = function (width: number) {
-		return mergeToolCards(origRender.call(this, width));
+		return decoratePendingSteer(mergeToolCards(origRender.call(this, width), width), width);
 	};
+	framePassReady = true;
 }
 
 /** Status keys hidden from the footer. `cursor` (pi-cursor-sdk's
@@ -505,30 +688,41 @@ const HIDDEN_STATUS_KEYS = new Set(["cursor"]);
 let footerApplied = false;
 function applyFooter(ctx: any) {
 	if (footerApplied || !ctx?.hasUI) return;
-	footerApplied = true;
 	if (typeof ctx.ui?.setFooter !== "function") {
 		try {
 			ctx.ui?.notify?.("amp-pi-style: ctx.ui.setFooter unavailable — stock footer kept", "warning");
 		} catch {}
 		return;
 	}
-	ctx.ui.setFooter((_tui: any, _theme: any, footerData: any) => ({
-		render(width: number) {
-			try {
-				const statuses = footerData?.getExtensionStatuses?.();
-				if (!statuses?.size) return [];
-				const text = [...statuses.entries()]
-					.filter(([key]) => !HIDDEN_STATUS_KEYS.has(key))
-					.sort(([a], [b]) => a.localeCompare(b))
-					.map(([, t]) => String(t).replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
-					.filter(Boolean)
-					.join(" ");
-				return text ? [`${DIM}${truncateToWidth(text, width)}${UNDIM}`] : [];
-			} catch {
-				return [];
-			}
-		},
-	}));
+	try {
+		ctx.ui.setFooter((_tui: any, theme: any, footerData: any) => {
+			activeTheme = theme;
+			return {
+				invalidate() {},
+				render(width: number) {
+				try {
+					const statuses = footerData?.getExtensionStatuses?.();
+					if (!statuses?.size) return [];
+					const text = [...statuses.entries()]
+						.filter(([key]) => !HIDDEN_STATUS_KEYS.has(key))
+						.sort(([a], [b]) => a.localeCompare(b))
+						.map(([, t]) => String(t).replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
+						.filter(Boolean)
+						.join(" ");
+					const fitted = hardTrim(text, width);
+					return fitted ? [theme?.fg?.("dim", fitted) ?? fitted] : [];
+				} catch {
+					return [];
+				}
+			},
+			};
+		});
+		footerApplied = true;
+	} catch {
+		try {
+			ctx.ui?.notify?.("amp-pi-style: custom footer failed — stock footer kept", "warning");
+		} catch {}
+	}
 }
 
 /** Hide the stock `Working...` spinner line — its info lives in the editor
@@ -582,75 +776,76 @@ function patchEditor() {
 		}
 		if (bottom === -1) bottom = lines.length - 1;
 
-		const scrollInfo = (line: string) => stripAnsi(line).match(/[↑↓] \d+ more/)?.[0] ?? null;
+		const scrollInfo = (line: string) => stripAnsi(line).match(/[↑↓] \d+ more/)?.[0] ?? "";
 
-		/** Corner + optional left label + fill + optional right label + corner,
-		 *  always exactly `width` columns; the right label yields when tight. */
-		const makeBorder = (
-			leftCorner: string,
-			rightCorner: string,
-			origLine: string,
-			leftPlain: string,
-			leftStyled: string,
-			rightPlain: string,
-			rightStyled: string,
-		) => {
+		/** Corner + low-volume labels + fill + corner, always exactly `width`
+		 *  columns. Right-side metadata yields before the current activity. */
+		const makeBorder = (leftCorner: string, rightCorner: string, origLine: string, leftLabel = "", rightLabel = "") => {
 			const scroll = scrollInfo(origLine);
-			if (scroll) {
-				leftPlain = `─ ${scroll} ${leftPlain}`;
-				leftStyled = bc(`─ ${scroll} `) + leftStyled;
-			}
-			let fill = width - 2 - colWidth(leftPlain) - colWidth(rightPlain);
-			if (fill < 1) {
+			let left = [scroll, leftLabel].filter(Boolean).join(" · ");
+			let leftPlain = left ? `─ ${left} ` : "";
+			let rightPlain = rightLabel ? ` ${rightLabel} ─` : "";
+			const inner = width - 2;
+
+			if (colWidth(leftPlain) + colWidth(rightPlain) > inner - 1) {
+				rightLabel = "";
 				rightPlain = "";
-				rightStyled = "";
-				fill = Math.max(1, width - 2 - colWidth(leftPlain));
 			}
-			return bc(leftCorner) + leftStyled + bc("─".repeat(fill)) + rightStyled + bc(rightCorner);
+			if (colWidth(leftPlain) > inner - 1) {
+				left = hardTrim(left, Math.max(0, inner - 4));
+				leftPlain = left ? `─ ${left} ` : "";
+			}
+
+			const fill = Math.max(1, inner - colWidth(leftPlain) - colWidth(rightPlain));
+			const leftStyled = left ? bc("─") + ` ${semantic("dim", left)} ` : "";
+			const rightStyled = rightLabel ? ` ${semantic("dim", rightLabel)} ${bc("─")}` : "";
+			const osc = origLine.match(LEADING_OSC_RE)?.[0] ?? "";
+			return osc + bc(leftCorner) + leftStyled + bc("─".repeat(fill)) + rightStyled + bc(rightCorner);
 		};
 
-		// Top border right: `$cost ─ model ─ ctx% ─ level`, all read live.
-		const parts: Array<[string, string]> = [];
+		// Top border: whole labels disappear by priority instead of tail-truncating
+		// into ambiguous model or metric fragments at narrow widths.
 		const cost = sessionCost();
-		if (cost !== null) {
-			const label = `$${cost >= 0.1 ? cost.toFixed(2) : cost.toFixed(3)}`;
-			parts.push([label, `${DIM}${label}${UNDIM}`]);
-		}
+		const costLabel = cost === null ? "" : `$${cost >= 0.1 ? cost.toFixed(2) : cost.toFixed(3)}`;
 		const model = lastCtx?.getModel?.() ?? lastCtx?.model;
-		const modelName = model?.name ?? model?.id;
-		if (modelName) parts.push([modelName, `${DIM}${modelName}${UNDIM}`]);
-		const pct = contextPercent();
-		if (pct) parts.push([pct, `${DIM}${pct}${UNDIM}`]);
-		const level = lastCtx?.getThinkingLevel?.() ?? thinkingLevel ?? "";
-		if (level) parts.push([level, bc(level)]);
-		const topPlain = parts.length ? ` ${parts.map(([p]) => p).join(" ─ ")} ─` : "";
-		const topStyled = parts.length ? ` ${parts.map(([, s]) => s).join(bc(" ─ "))} ${bc("─")}` : "";
-		lines[0] = makeBorder("╭", "╮", lines[0], "", "", topPlain, topStyled);
+		const modelName = String(model?.name ?? model?.id ?? "");
+		const modelId = String(model?.id ?? modelName)
+			.split("/")
+			.pop()!
+			.replace(/-20\d{6,8}$/, "");
+		const pct = contextPercent() ?? "";
+		const level = String(lastCtx?.getThinkingLevel?.() ?? thinkingLevel ?? "");
+		const availableTop = Math.max(0, width - 6 - (scrollInfo(lines[0]) ? colWidth(scrollInfo(lines[0])) + 3 : 0));
+		const join = (values: string[], separator: string) => values.filter(Boolean).join(separator);
+		const topCandidates = [
+			join([costLabel, modelName, pct, level], " ─ "),
+			join([costLabel, modelName, pct, level], " · "),
+			join([modelName, pct, level], " · "),
+			join([modelName, level], " · "),
+			join([modelId, level], " · "),
+			level,
+		];
+		const topLabel = topCandidates.find((candidate) => candidate && colWidth(candidate) <= availableTop) ?? "";
+		lines[0] = makeBorder("╭", "╮", lines[0], "", topLabel);
 
-		// Bottom border: animated `≈ Thinking 13 tok` left, abbreviated cwd right.
-		let status = workPhase;
-		if (status && workTokens > 0) {
+		// Bottom border: current activity owns the left; cwd uses only the
+		// remaining right-side budget and keeps meaningful path endpoints.
+		let status = workPhase ?? "";
+		if (status && workTokens > 0 && width >= 48) {
 			const tok = workTokens >= 1000 ? `${(workTokens / 1000).toFixed(1)}k` : `${workTokens}`;
 			status = `${status} ${tok} tok`;
 		}
 		const frame = BORDER_SPIN[Math.floor(Date.now() / 250) % BORDER_SPIN.length];
-		const botLeftPlain = status ? `─ ${frame} ${status} ` : "";
-		const botLeftStyled = status ? bc("─") + ` ${DIM}${frame} ${status}${UNDIM} ` : "";
-		const path = displayPath(Math.max(12, Math.floor(width / 2)));
-		lines[bottom] = makeBorder(
-			"╰",
-			"╯",
-			lines[bottom],
-			botLeftPlain,
-			botLeftStyled,
-			` ${path} ─`,
-			` ${DIM}${path}${UNDIM} ${bc("─")}`,
-		);
+		const activity = status ? `${frame} ${status}` : "";
+		const leftWidth = activity ? colWidth(activity) + 3 : 0;
+		const pathBudget = Math.min(Math.floor(width / 2), Math.max(0, width - 6 - leftWidth));
+		const path = pathBudget >= 8 ? displayPath(pathBudget) : "";
+		lines[bottom] = makeBorder("╰", "╯", lines[bottom], activity, path);
 
 		for (let i = 1; i < lines.length; i++) {
 			if (i === bottom) continue;
-			if (i < bottom) lines[i] = bc("│") + lines[i] + bc("│");
-			else lines[i] = "  " + lines[i];
+			if (i < bottom) lines[i] = afterLeadingOsc(lines[i], bc("│")) + bc("│");
+			else lines[i] = afterLeadingOsc(lines[i], "  ");
 		}
 		return lines;
 	};

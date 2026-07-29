@@ -1,31 +1,63 @@
 # amp-pi-style
 
-Amp-inspired look & feel for the [pi coding agent](https://github.com/earendil-works/pi): flat, calm, compact.
+Amp-inspired look and feel for the [pi coding agent](https://github.com/earendil-works/pi): a calm, compact engineering transcript with live state close to the composer.
 
-See [DESIGN_LANGUAGE.md](./DESIGN_LANGUAGE.md) for a detailed Chinese-language distillation of Amp CLI's visual and interaction design system.
+See [DESIGN_LANGUAGE.md](./DESIGN_LANGUAGE.md) for the detailed Chinese-language design model behind the package. The implementation follows its central rule: preserve understanding while minimizing attention cost.
 
 ## What you get
 
-**Transcript**
+**Transcript first**
 
-- Flat rendering — no message bubbles, exactly one blank line between blocks.
-- User messages: italic, accent-colored, with a thin `▎` bar on the left (Amp's prompt echo).
-- Thinking hidden from the transcript (live status lives in the editor border); `ctrl+t` restores it.
-- Tool calls as one-line cards: `✓ Edited path +5 -1 ▸`, `✗ $ cmd ▸`, animated `∴` while running; `ctrl+o` expands the full output.
-- Consecutive cards merge Amp-style: `✗ Ran 15 commands, 2 failed ▸`, `✓ Read 3 files ▸`.
+- Flat, single-column rendering with no chat bubbles and one stable blank line between blocks.
+- User prompts use italic text and a thin accent-colored `▎` rail. Wrapped lines retain the rail without disturbing OSC semantic-prompt marks.
+- Thinking stays out of the transcript when `hideThinkingBlock` is enabled. `ctrl+t` still restores the complete thinking view.
+- Completed tools become expandable semantic summaries:
 
-**Editor**
+```text
+✓ Searched terminal unicode width ▸
+✓ Read src/config.ts ▸
+✓ Edited src/config.ts +5 -1 ▸
+✗ $ npm test ▸
+```
 
-- Rounded box whose border color tracks the thinking level (gray when off → green → yellow → red) and bash mode.
-- Top border: `$0.012 ─ grok-4.5 ─ 8.6% ─ medium` — live session cost, model, context usage, thinking level.
-- Bottom border: animated `≈ Thinking 13 tok` while the agent works; abbreviated cwd (`~/…/PhD/00_thesis`) on the right.
-- `∴ Running bash · read` activity line above the box while tools execute.
-- Stock footer path/stats and the `Working...` spinner are folded into the border; extension status lines (`ctx.ui.setStatus`) still show, dimmed (footer replaced via pi's official `setFooter` API). The `cursor` status from pi-cursor-sdk is hidden as redundant — edit `HIDDEN_STATUS_KEYS` to taste. Retry/compaction notices stay.
+- Adjacent command, search, read, and edit cards compress into bounded work summaries such as `✗ Ran 15 commands, 2 failed ▸` and `✓ Edited 4 files +83 -17 ▸`.
+- `ctrl+o` always returns to Pi's full renderer, so compact presentation never removes diagnostic detail.
 
-**Themes**
+**Composer as the state home**
 
-- `amp-style` — cool slate + mint green accent; backgrounds inherit your terminal color.
-- `amp-warm` — near-black + Amp's orange `#E7894C`, from Amp's own palette.
+```text
+╭────────────────── $0.03 ─ model ─ 18% ─ high ─╮
+│ next instruction                                │
+╰─ ≈ Editing 2 files ──────────────── ~/repo/app ─╯
+```
+
+- The rounded border continues to reflect thinking level and bash mode.
+- The top border carries live cost, model, context usage, and thinking level at low visual volume.
+- Narrow terminals remove whole metadata labels by priority. They never leave misleading partial prices, percentages, or model fragments.
+- The bottom border is the single home for current activity: `Thinking`, `Streaming`, `Exploring 2 searches`, `Running 3 commands`, `Reading 1 file`, or `Editing 2 files`.
+- Queued steering becomes an attached rounded rail above the composer: the latest instruction stays visible, multiple queued messages compress to a count, and `Enter to steer` keeps the interaction discoverable.
+- The cwd keeps its origin and meaningful tail with middle elision, for example `~/Library/…/project/src`.
+- Scroll indicators such as `↑ 4 more` and `↓ 2 more` remain intact.
+- Pi's stock `Working...` row becomes visually blank but retains its fixed height and animation timer, preventing layout movement while keeping border animation alive. Retry and compaction notices remain visible.
+
+**Quiet semantic themes**
+
+- `amp-style`: cool slate neutrals, mint focus, restrained green success, and soft red errors.
+- `amp-warm`: near-black neutrals with Amp orange focus and a quieter teal-green success role.
+- Both themes use the same semantic token structure and inherit the terminal background for user, assistant, custom, pending, successful, and failed tool content.
+- Color reinforces meaning but does not create it. `✓`, `✗`, action words, counts, and `▸` remain understandable under limited-color or `NO_COLOR` conditions.
+
+## Responsive behavior
+
+The renderer uses Pi TUI's ANSI-, grapheme-, emoji-, and CJK-aware width primitives.
+
+- Compact tool cards reserve one terminal column to avoid hard-wrap artifacts; below 8 columns they use Pi's stock renderer.
+- Narrow cards drop diff statistics before shortening the action and target.
+- Grouping begins at 16 columns. Narrower views keep the already bounded individual cards instead.
+- Grouped failures retain the failure symbol, action count, failed count, and expansion affordance before less important statistics.
+- Composer metadata removes separators and low-priority labels before sacrificing the current activity.
+- Below 24 columns, the editor safely falls back to Pi's stock renderer.
+- Leading OSC 133 sequences remain at the start of prefixed and rebuilt lines for Ghostty, iTerm2, and other semantic-prompt terminals.
 
 ## Install
 
@@ -33,7 +65,7 @@ See [DESIGN_LANGUAGE.md](./DESIGN_LANGUAGE.md) for a detailed Chinese-language d
 pi install git:github.com/xuzai9964/amp-pi-style
 ```
 
-Then in `~/.pi/agent/settings.json` (or via `/settings` in pi):
+Then configure `~/.pi/agent/settings.json`, or use `/settings` in Pi:
 
 ```json
 {
@@ -42,19 +74,29 @@ Then in `~/.pi/agent/settings.json` (or via `/settings` in pi):
 }
 ```
 
-`hideThinkingBlock: true` is what moves thinking out of the transcript; without it thinking blocks render normally.
+`hideThinkingBlock: true` moves thinking into live composer state. Without it, Pi renders thinking blocks normally.
 
 ## Recommended companion settings
 
-For output *density* (the model's writing habits, which no renderer can fix), add rules like these to `~/.pi/agent/AGENTS.md`:
+A renderer can compress tools and chrome, but it cannot repair verbose model output. For matching transcript density, add guidance like this to `~/.pi/agent/AGENTS.md`:
 
-- at most one blank line between paragraphs; prefer short prose over lists
-- don't announce every tool call or echo tool output
-- summaries as a concise engineering handoff: what changed, why correct, what was verified, what remains
+- use at most one blank line between paragraphs and prefer short prose over lists
+- do not announce every tool call or repeat visible tool output
+- write final summaries as a concise engineering handoff: what changed, why it is correct, what was verified, and what remains
 
-## How it works / caveats
+## How it works
 
-The extension uses pi's official extension APIs where they exist — the footer is replaced via `ctx.ui.setFooter` (keeping extension status lines), the activity line via `setWidget` — and patches pi's exported TUI component prototypes at load time for the rest (user/assistant messages, tool cards, editor, loader, and a line-level pass over the final TUI render for card grouping). Every patch is guarded: if a future pi version renames these internals, the patches degrade to no-ops instead of crashing — the UI reverts to stock and a one-time load notice names the failed patches. The loader stays a prototype patch on purpose: pi's `setWorkingVisible(false)` would also remove the animation timer that repaints the border spinner. Live values (model, thinking level, context, cost) are read through the extension context's stable getters at render time. Collapsed tool cards carry an invisible marker so grouping only merges this package's cards.
+The extension prefers Pi's official APIs where they exist. It replaces the footer through `ctx.ui.setFooter`, preserving dimmed extension statuses except intentionally hidden redundant keys such as `cursor`.
+
+Pi does not expose official APIs for every visual surface, so user messages, assistant spacing, tool summaries, card grouping, the working loader, and editor chrome use guarded prototype patches. Every patch checks that its target exists and marks itself for idempotence. Missing or renamed internals produce one diagnostic notice and use safe or stock behavior instead of crashing the agent.
+
+The working loader remains a prototype patch by design. Calling `setWorkingVisible(false)` would remove the timer that repaints the composer-border spinner between stream events.
+
+Live model, thinking, context, and cost values come from the extension context at render time. Collapsed cards carry an invisible marker, so the final transcript pass never merges lookalike assistant text. That same bounded pass recognizes Pi's own queued-steering rows and turns them into the attached rail without changing queue behavior.
+
+## Deliberate scope
+
+This package is purely visual. It does not replace Pi's command palette, session navigation, sidebar behavior, notifications, model selection, tool execution, or agent behavior. Those host-owned surfaces remain available and consistent with Pi. The package focuses on the transferable parts of the Amp design language that can be applied safely: hierarchy, compression, progressive disclosure, stable geometry, semantic color, and graceful degradation.
 
 ## License
 
