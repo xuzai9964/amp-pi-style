@@ -18,6 +18,8 @@
  *   middle-elided cwd. Scroll indicators (`↑ N more`) remain intact.
  * - Queued steering messages become an attached, one-line summary rail with an
  *   `Enter to steer` affordance; multiple messages compress without height jitter.
+ * - Experimental `AMP_PI_PIN_COMPOSER=1` bottom-aligns the lower frame when the
+ *   transcript is shorter than the terminal; unsupported editor layouts fall back.
  * - The stock footer is replaced through `ctx.ui.setFooter`: extension statuses
  *   remain dimmed, except hidden redundant keys such as `cursor`.
  * - The stock `Working...` row is blanked but keeps its fixed height and repaint
@@ -65,7 +67,12 @@ const STEER_MARK = "\x1b]777;amp-pi-style;steer\x07";
 const FOLLOW_UP_MARK = "\x1b]777;amp-pi-style;follow-up\x07";
 const QUEUE_HINT_MARK = "\x1b]777;amp-pi-style;queue-hint\x07";
 const QUEUE_MARKS = [STEER_MARK, FOLLOW_UP_MARK, QUEUE_HINT_MARK];
-const FRAME_MARKS = [CARD_MARK, ...QUEUE_MARKS];
+/** Marks the active composer boundary for the optional final-frame anchor pass. */
+const COMPOSER_MARK = "\x1b]777;amp-pi-style;composer\x07";
+const FRAME_MARKS = [CARD_MARK, ...QUEUE_MARKS, COMPOSER_MARK];
+/** Experimental because pi-tui is an inline renderer without an official
+ *  bottom-aligned layout primitive. Disabled unless explicitly requested. */
+const PIN_COMPOSER = /^(?:1|true|yes|on)$/i.test(process.env.AMP_PI_PIN_COMPOSER ?? "");
 
 /** Leading OSC sequences (e.g. OSC 133 semantic-prompt marks) that must stay at
  *  the very start of a line — semantic-prompt terminals (Ghostty, iTerm2) break
@@ -656,7 +663,25 @@ function patchPendingMessages() {
 	}
 }
 
-/** Final TUI pass: merge adjacent tool cards and frame queued steering. */
+/** Fill the flexible space immediately before the active composer so the
+ *  lower frame ends at the terminal bottom. Pi's normal bottom viewport takes
+ *  over once content is taller than the terminal. Exactly one marker is
+ *  required: dialogs, replaced editors, and incompatible internals stay stock. */
+function pinComposer(lines: string[], terminalRows: number): string[] {
+	if (!PIN_COMPOSER || !Number.isFinite(terminalRows) || terminalRows <= 0 || lines.length >= terminalRows) {
+		return lines;
+	}
+	const composers: number[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		if (lines[i].includes(COMPOSER_MARK)) composers.push(i);
+	}
+	if (composers.length !== 1) return lines;
+	const fill = terminalRows - lines.length;
+	return [...lines.slice(0, composers[0]), ...Array(fill).fill(""), ...lines.slice(composers[0])];
+}
+
+/** Final TUI pass: merge adjacent tool cards, anchor the optional composer,
+ *  and frame queued steering. */
 function patchCardGrouping() {
 	const proto = TUI?.prototype as any;
 	if (!proto) return guard("cardGrouping", false);
@@ -670,7 +695,9 @@ function patchCardGrouping() {
 	proto.__ampStyle = true;
 	proto.__ampStyleFrame2 = true;
 	proto.render = function (width: number) {
-		return decoratePendingSteer(mergeToolCards(origRender.call(this, width), width), width);
+		const merged = mergeToolCards(origRender.call(this, width), width);
+		const anchored = pinComposer(merged, Number(this.terminal?.rows ?? 0));
+		return decoratePendingSteer(anchored, width);
 	};
 	framePassReady = true;
 }
@@ -759,10 +786,20 @@ function patchEditor() {
 
 	const baseRender = proto.render; // inherited from pi-tui Editor
 	if (typeof baseRender !== "function") return guard("editor", false);
+	const markComposer = (editor: any, lines: string[]): string[] => {
+		// Pi assigns onPasteImage only to the mounted main composer (and copies it
+		// to supported replacements). Generic CustomEditor instances in overlays
+		// render after the final-frame pass, so they must never carry frame marks.
+		if (PIN_COMPOSER && typeof editor?.onPasteImage === "function" && lines.length > 0) {
+			lines[0] = afterLeadingOsc(lines[0], COMPOSER_MARK);
+		}
+		return lines;
+	};
 	proto.render = function (width: number) {
-		if (width < 24) return baseRender.call(this, width);
+		if (width < 24) return markComposer(this, baseRender.call(this, width));
 		const lines: string[] = baseRender.call(this, width - 2);
-		if (lines.length < 2) return lines;
+		if (lines.length < 2) return markComposer(this, lines);
+
 		const bc = typeof this.borderColor === "function" ? this.borderColor : (s: string) => s;
 
 		// Bottom border: last line that is a pure border (starts with ─).
@@ -847,6 +884,6 @@ function patchEditor() {
 			if (i < bottom) lines[i] = afterLeadingOsc(lines[i], bc("│")) + bc("│");
 			else lines[i] = afterLeadingOsc(lines[i], "  ");
 		}
-		return lines;
+		return markComposer(this, lines);
 	};
 }
