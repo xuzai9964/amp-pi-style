@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+echo "==> Checking required orb tools"
+for command_name in git node npm; do
+	if ! command -v "$command_name" >/dev/null 2>&1; then
+		echo "error: required command not found: $command_name" >&2
+		exit 1
+	fi
+done
+
+echo "==> Validating package metadata and themes"
+node - <<'NODE'
+const { readFileSync } = require("node:fs");
+
+for (const path of [
+	"package.json",
+	"themes/amp-style.json",
+	"themes/amp-warm.json",
+]) {
+	JSON.parse(readFileSync(path, "utf8"));
+}
+NODE
+
+test -f extensions/amp-style.ts
+
+echo "==> Orb setup complete (this package has no local dependencies or services)"

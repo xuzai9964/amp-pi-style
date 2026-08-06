@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+# This package has no long-running services or external state to restore.
+test -f package.json
+echo "Orb resume complete (no services to restore)"
