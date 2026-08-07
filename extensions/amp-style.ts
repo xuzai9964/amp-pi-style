@@ -2,36 +2,46 @@
  * amp-pi-style — Grok-informed look & feel for the pi coding agent. Purely visual.
  *
  * Transcript
- * - User messages: no vertical padding, raised band, `❯` prompt arrow with aligned continuations.
- * - Assistant messages: no leading blank line, exactly one blank line between blocks.
- * - Thinking: Pi owns visibility and ctrl+t behavior; visible thinking is recommended.
- * - Tool calls: operation-first one-line summaries such as `Search query ▸`,
- *   `Edit path +5 -1 ▸`, and `✗ $ cmd ▸`; ctrl+o keeps full details reachable.
- * - Adjacent command/search/read/edit cards become bounded work summaries. An
+ * - User messages: canvas-flat prompt rows with vertical breathing room and a
+ *   `❯` prompt arrow whose continuations stay aligned.
+ * - Assistant messages: no leading blank line; thinking gains Grok's subdued
+ *   `◆` header and `┃` rail while Pi keeps ctrl+t visibility behavior.
+ * - Tool calls: muted operation-first rows led by `◆`, a quiet running dot,
+ *   or `✗`; ctrl+o still restores Pi's full diagnostic renderer.
+ * - Adjacent command/search/read/edit rows become bounded work summaries. An
  *   invisible marker prevents grouping unrelated transcript text.
  *
- * Editor
- * - Rounded box; border color tracks thinking level and bash mode.
- * - Box lines keep one column of slack so they never hit the exact terminal
- *   width (Ghostty/iTerm auto-wrap would otherwise collide with the next row).
- * - Top border: live model/context/level metadata drops whole low-priority
- *   labels as width tightens, never leaving ambiguous tail fragments.
- * - Bottom border: the single home for animated, semantic work activity and a
- *   middle-elided cwd. Scroll indicators (`↑ N more`) remain intact.
- * - Queued steering messages become an attached, one-line summary rail with an
+ * Live region
+ * - Pi's official above-editor widget becomes Grok's dedicated turn-status row;
+ *   it owns the only activity spinner and leaves a stable prompt gap.
+ * - Pi's official footer becomes a separate agent-status row: cwd/git at left,
+ *   context and extension state at right. It never shares the prompt border.
+ * - The rounded prompt uses quiet active/idle borders, a `❯` input prefix, and
+ *   only model/mode information in its bottom divider. Scroll indicators remain.
+ * - Queued steering messages become a flat diamond summary row with an
  *   `Enter to steer` affordance; multiple messages compress without height jitter.
  * - Experimental pinned-composer layout bottom-aligns the lower frame when the
  *   transcript is short. It defaults on for macOS and `AMP_PI_PIN_COMPOSER`
  *   explicitly toggles it on or off; unsupported editor layouts fall back.
- * - The stock footer is replaced through `ctx.ui.setFooter`: extension statuses
- *   remain dimmed, except hidden redundant keys such as `cursor`.
- * - The stock `Working...` row is blanked but keeps its fixed height and repaint
- *   timer. Retry and compaction loaders remain visible.
+ *  - The stock working indicator is disabled through Pi's official API. The
+ *   turn-status widget owns its repaint timer; retry/compaction rows stay stock.
+ *
+ * Canvas
+ * - In fullscreen (alternate-screen) mode the extension paints every rewritten
+ *   cell onto one opaque background, including padding after ANSI resets, so the
+ *   Grok canvas stays continuous across transcript, prompt, and footer even in
+ *   translucent terminals. Selection, overlays, and semantic diff states remain
+ *   the only elevated surfaces. The color comes from the active theme's
+ *   `vars.canvas` via `CANVAS_BY_THEME`, is overridable with `AMP_PI_CANVAS`,
+ *   and `AMP_PI_CANVAS=0` restores terminal inheritance. Inline mode always
+ *   inherits the terminal so scrollback is never flooded with colored blocks.
  *
  * Implementation: official APIs where available, guarded prototype patches for
- * the remaining surfaces. Width and truncation use pi-tui's ANSI/grapheme-safe
- * primitives; leading OSC semantic-prompt marks stay at byte zero. Missing or
- * renamed internals fall back safely and produce one diagnostic notice.
+ * the remaining surfaces. Event contexts are reduced to plain render snapshots
+ * and cleared on session shutdown; no timer-driven renderer retains guarded Pi
+ * context getters. Width and truncation use pi-tui's ANSI/grapheme-safe primitives;
+ * leading OSC semantic-prompt marks stay at byte zero. Missing or renamed
+ * internals fall back safely and produce one diagnostic notice.
  */
 import {
 	AssistantMessageComponent,
@@ -43,23 +53,27 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import * as PiTui from "@earendil-works/pi-tui";
 
-const { Loader, TUI, TuiMainScreen, TuiAltScreen, TruncatedText, truncateToWidth } = PiTui as any;
+const { HStack, TUI, TuiMainScreen, TuiAltScreen, TruncatedText, truncateToWidth } = PiTui as any;
 const visibleWidthSafe = (PiTui as any).visibleWidth as ((text: string) => number) | undefined;
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 // ── constants ────────────────────────────────────────────────────────────────
 
-/** Shared Braille activity spinner (repaints ride the stock loader timer). */
+/** Shared fullscreen gutter. It is applied once at the layout root so every
+ *  transcript and dock surface keeps the same baseline and wrap width. */
+const SCREEN_GUTTER = 2;
+
+/** Braille activity spinner owned by the turn-status widget. */
 const ACTIVITY_SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 /** Tools whose cards read `Edit/Write <path>` and get diff +N -M stats. */
 const EDIT_TOOLS = new Set(["edit", "write", "cursor", "apply_patch", "multiedit"]);
 
-/** Collapsed completed tool-card line, used for grouping. Running rows have a
- *  Braille spinner and deliberately do not match. */
-const CARD_RE = /^(?:(✗) )?(\$ |Read |Search |Edit |Write )/;
-/** Diff stats at the end of an edit card: `+5 -1 ▸`. */
-const CARD_STATS_RE = /\+(\d+) -(\d+) ▸\s*$/;
+/** Collapsed completed tool-card line, used for grouping. Running rows use a
+ *  static dot and deliberately do not match. */
+const CARD_RE = /^(◆|✗) (Run |Read |Search |Edit |Write )/;
+/** Diff stats at the end of an edit card: `+5 -1`. */
+const CARD_STATS_RE = /\+(\d+) -(\d+)\s*$/;
 /** Zero-width markers scope final-frame transforms to rows created by this
  *  extension or by Pi's own queued-message renderer. */
 const CARD_MARK = "\x1b]777;amp-pi-style;card\x07";
@@ -67,9 +81,11 @@ const STEER_MARK = "\x1b]777;amp-pi-style;steer\x07";
 const FOLLOW_UP_MARK = "\x1b]777;amp-pi-style;follow-up\x07";
 const QUEUE_HINT_MARK = "\x1b]777;amp-pi-style;queue-hint\x07";
 const QUEUE_MARKS = [STEER_MARK, FOLLOW_UP_MARK, QUEUE_HINT_MARK];
-/** Marks the active composer boundary for the optional final-frame anchor pass. */
+/** Marks the first live-region row and the composer fallback for the optional
+ *  final-frame anchor pass. */
+const LIVE_MARK = "\x1b]777;amp-pi-style;live\x07";
 const COMPOSER_MARK = "\x1b]777;amp-pi-style;composer\x07";
-const FRAME_MARKS = [CARD_MARK, ...QUEUE_MARKS, COMPOSER_MARK];
+const FRAME_MARKS = [CARD_MARK, ...QUEUE_MARKS, LIVE_MARK, COMPOSER_MARK];
 /** Experimental because pi-tui is an inline renderer without an official
  *  bottom-aligned layout primitive. macOS defaults on; the environment variable
  *  remains an explicit cross-platform override. */
@@ -78,20 +94,56 @@ const PIN_COMPOSER = PIN_COMPOSER_ENV
 	? /^(?:1|true|yes|on)$/i.test(PIN_COMPOSER_ENV)
 	: process.platform === "darwin";
 
+/** Opaque fullscreen canvas per shipped theme. Must mirror each theme's
+ *  `vars.canvas` / `export.pageBg`; `AMP_PI_CANVAS` overrides, `0`/`off`
+ *  disables (inherit the terminal). Unknown themes inherit the terminal. */
+const CANVAS_BY_THEME: Record<string, string> = {
+	"amp-style": "#141414",
+	"amp-warm": "#0f0f0f",
+};
+const CANVAS_ENV = process.env.AMP_PI_CANVAS?.trim();
+const CANVAS_ROW_RE = /\x1b\[(\d+);1H\x1b\[2K/g;
+const CANVAS_IMAGE_RE = /\x1b_G|\x1b]1337;/;
+/** First frame suffix that must remain outside row paint. Covers absolute
+ *  hardware-cursor placement, cursor visibility, and synchronized-output end. */
+const CANVAS_SUFFIX_RE = /\x1b\[(?:\d+;\d+H|\?25[hl]|\?2026l)/;
+
 /** Leading OSC sequences (e.g. OSC 133 semantic-prompt marks) that must stay at
  *  the very start of a line — semantic-prompt terminals (Ghostty, iTerm2) break
  *  the line if anything is printed before them. */
 const LEADING_OSC_RE = /^(?:\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))+/;
 
-// ── live session state (fed by extension events, read at render time) ────────
+// ── live session state (snapshotted from extension events) ──────────────────
 
-let lastCtx: any = null;
-let activeTheme: any = null;
-let thinkingLevel: string | null = null;
-let workPhase: string | null = null;
+type SessionSnapshot = {
+	modelName: string;
+	modelId: string;
+	contextTokens: number | null;
+	contextWindow: number | null;
+	cwd: string;
+	thinkingLevel: string | null;
+};
+
+type LiveState = {
+	activeTheme: any;
+	session: SessionSnapshot | null;
+	workPhase: string | null;
+	framePassReady: boolean;
+};
+
+/** Prototype patches survive Pi's extension reload, while module scope does not.
+ *  Keep their render-only data in a reload-stable slot, and never retain an
+ *  ExtensionContext whose guarded getters become stale on session replacement. */
+const LIVE_STATE_KEY = Symbol.for("amp-pi-style.live-state.v1");
+const stateHost = globalThis as any;
+const liveState: LiveState = (stateHost[LIVE_STATE_KEY] ??= {
+	activeTheme: null,
+	session: null,
+	workPhase: null,
+	framePassReady: false,
+});
+
 let activeTools = 0;
-let framePassReady = false;
-let ctxUsageCache = { at: 0, value: null as any };
 const failedPatches: string[] = [];
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -130,25 +182,32 @@ const tailCols = (s: string, max: number): string => {
 };
 
 /** Apply a semantic theme role. Plain text is the safe pre-context/NO_COLOR fallback. */
-function semantic(role: "accent" | "success" | "error" | "dim" | "text" | "borderMuted" | "toolOutput", text: string): string {
+function semantic(
+	role: "accent" | "success" | "error" | "warning" | "muted" | "dim" | "text" | "border" | "borderMuted" | "toolTitle" | "toolOutput",
+	text: string,
+): string {
 	try {
-		const fg = activeTheme?.fg;
-		return typeof fg === "function" ? fg.call(activeTheme, role, text) : text;
+		const fg = liveState.activeTheme?.fg;
+		return typeof fg === "function" ? fg.call(liveState.activeTheme, role, text) : text;
 	} catch {
 		return text;
 	}
 }
 
-/** Context usage as a percent label, refreshed at most once per second. */
-function contextPercent(): string | null {
-	const now = Date.now();
-	if (now - ctxUsageCache.at > 1000) {
-		ctxUsageCache = { at: now, value: lastCtx?.getContextUsage?.() ?? null };
+/** Bold text through the active Pi theme, with a plain fallback. */
+function strong(text: string): string {
+	try {
+		const bold = liveState.activeTheme?.bold;
+		return typeof bold === "function" ? bold.call(liveState.activeTheme, text) : text;
+	} catch {
+		return text;
 	}
-	const u = ctxUsageCache.value;
-	const model = lastCtx?.getModel?.() ?? lastCtx?.model;
-	const tokens = u?.tokens ?? u?.contextTokens;
-	const window = u?.contextWindow ?? model?.contextWindow;
+}
+
+/** Context usage as a percent label from the latest lifecycle-safe snapshot. */
+function contextPercent(): string | null {
+	const tokens = liveState.session?.contextTokens;
+	const window = liveState.session?.contextWindow;
 	if (!tokens || !window) return null;
 	const pct = (tokens / window) * 100;
 	return pct >= 10 ? `${Math.round(pct)}%` : `${pct.toFixed(1)}%`;
@@ -158,7 +217,7 @@ function contextPercent(): string | null {
 function displayPath(max: number): string {
 	if (max <= 0) return "";
 	const home = process.env.HOME;
-	const cwd: string = lastCtx?.cwd ?? process.cwd();
+	const cwd = liveState.session?.cwd ?? process.cwd();
 	const p = home && cwd.startsWith(home) ? "~" + cwd.slice(home.length) : cwd;
 	if (colWidth(p) <= max) return p;
 	const seg = p.split("/");
@@ -178,6 +237,110 @@ function displayPath(max: number): string {
 function afterLeadingOsc(line: string, text: string): string {
 	const m = line.match(LEADING_OSC_RE);
 	return m ? m[0] + text + line.slice(m[0].length) : text + line;
+}
+
+/** Left/right status layout that drops whole right-side items before it trims
+ *  the identity-bearing left side. */
+function statusLine(left: string, rightItems: string[], width: number): string {
+	if (width <= 0) return "";
+	const items = rightItems.filter(Boolean);
+	while (items.length > 0) {
+		const right = items.join(` ${semantic("dim", "│")} `);
+		const gap = width - colWidth(left) - colWidth(right);
+		if (gap >= 1) return `${left}${" ".repeat(gap)}${right}`;
+		items.shift();
+	}
+	return hardTrim(left, width);
+}
+
+/** Background ANSI prefix for a `#RRGGBB` color, or null when invalid.
+ *  Match Pi's active truecolor/256-color mode so the canvas survives SSH and
+ *  older terminals instead of forcing a `48;2` sequence they may ignore. */
+function hexToBgAnsi(hex: string, mode = "truecolor"): string | null {
+	const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+	if (!m) return null;
+	const n = parseInt(m[1], 16);
+	const r = (n >> 16) & 255;
+	const g = (n >> 8) & 255;
+	const b = n & 255;
+	if (mode === "truecolor") return `\x1b[48;2;${r};${g};${b}m`;
+
+	const cube = [0, 95, 135, 175, 215, 255];
+	const nearest = (value: number, values: number[]) =>
+		values.reduce((best, candidate, index) =>
+			Math.abs(candidate - value) < Math.abs(values[best] - value) ? index : best, 0);
+	const ri = nearest(r, cube);
+	const gi = nearest(g, cube);
+	const bi = nearest(b, cube);
+	const cubeIndex = 16 + 36 * ri + 6 * gi + bi;
+	const distance = (ar: number, ag: number, ab: number, br: number, bg: number, bb: number) =>
+		(ar - br) ** 2 * 0.299 + (ag - bg) ** 2 * 0.587 + (ab - bb) ** 2 * 0.114;
+	const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+	const grayValues = Array.from({ length: 24 }, (_, i) => 8 + i * 10);
+	const graySlot = nearest(gray, grayValues);
+	const grayIndex = 232 + graySlot;
+	const index = Math.max(r, g, b) - Math.min(r, g, b) < 10 &&
+		distance(r, g, b, grayValues[graySlot], grayValues[graySlot], grayValues[graySlot]) <
+			distance(r, g, b, cube[ri], cube[gi], cube[bi])
+		? grayIndex
+		: cubeIndex;
+	return `\x1b[48;5;${index}m`;
+}
+
+/** The opaque fullscreen canvas ANSI prefix, or null to inherit the terminal.
+ *  Environment override wins; otherwise the active theme's known canvas. */
+function canvasAnsi(): string | null {
+	const mode = String(liveState.activeTheme?.getColorMode?.() ?? "truecolor");
+	if (CANVAS_ENV) {
+		return /^(?:0|false|off|no|none)$/i.test(CANVAS_ENV) ? null : hexToBgAnsi(CANVAS_ENV, mode);
+	}
+	const hex = CANVAS_BY_THEME[String(liveState.activeTheme?.name ?? "")];
+	return hex ? hexToBgAnsi(hex, mode) : null;
+}
+
+/** Paint one rewritten row: canvas background under the line, then canvas
+ *  padding to the full terminal width. Kitty/iTerm2 image rows are untouched.
+ *  Any full SGR or background reset (overlay/scrollbar composition, line resets)
+ *  would otherwise punch a terminal-default hole through the surface, so the
+ *  canvas is re-applied after every reset inside the segment. */
+function paintCanvasSegment(seg: string, width: number, ansi: string): string {
+	// Paint image-row cells first, return to column one, then emit the original
+	// Kitty/iTerm payload byte-for-byte. This fills uncovered image-row columns
+	// without wrapping or modifying the transport sequence itself.
+	if (CANVAS_IMAGE_RE.test(seg)) return `${ansi}${" ".repeat(width)}\x1b[0m\r${seg}`;
+	const body = seg.replace(/\x1b\[([0-9;]*)m/g, (sgr, params: string) => {
+		const codes = params === "" ? [0] : params.split(";").map(Number);
+		return codes.includes(0) || codes.includes(49) ? `${sgr}${ansi}` : sgr;
+	});
+	const pad = Math.max(0, width - colWidth(seg));
+	if (pad === 0) return `${ansi}${body}\x1b[0m`;
+	return `${ansi}${body}\x1b[0m${ansi}${" ".repeat(pad)}\x1b[0m`;
+}
+
+/** Rewrite a fullscreen frame buffer so every emitted row carries the opaque
+ *  canvas background. Only rows the renderer actually rewrites appear in the
+ *  buffer; unchanged rows keep their already-painted terminal state, and the
+ *  final cursor positioning escape is left outside any paint wrap. */
+function paintScreenBuffer(buffer: string, width: number, ansi = canvasAnsi()): string {
+	if (!ansi || width <= 0) return buffer;
+	const pieces = buffer.split(CANVAS_ROW_RE);
+	if (pieces.length < 3) return buffer;
+	let out = pieces[0];
+	for (let i = 1; i + 1 < pieces.length; i += 2) {
+		out += `\x1b[${pieces[i]};1H\x1b[2K`;
+		const content = pieces[i + 1];
+		const suffixAt = content.search(CANVAS_SUFFIX_RE);
+		if (suffixAt > 0) {
+			out += paintCanvasSegment(content.slice(0, suffixAt), width, ansi) + content.slice(suffixAt);
+		} else if (suffixAt === -1) {
+			out += paintCanvasSegment(content, width, ansi);
+		} else {
+			// An empty final row can begin immediately with cursor/sync suffixes.
+			// Paint its cells before emitting that suffix unchanged.
+			out += paintCanvasSegment("", width, ansi) + content;
+		}
+	}
+	return out;
 }
 
 // ── tool-card grouping (line-level pass over the final TUI render) ───────────
@@ -208,7 +371,7 @@ const firstText = (value: any, keys: string[]): string => {
 function toolSummary(name: string, args: any): string {
 	const cat = toolCategory(name);
 	const path = firstText(args, ["path", "file", "filePath", "url"]);
-	if (cat === "cmd" && typeof args?.command === "string") return `$ ${oneLine(args.command.split(/\r?\n/)[0])}`;
+	if (cat === "cmd" && typeof args?.command === "string") return `Run ${oneLine(args.command.split(/\r?\n/)[0])}`;
 	if (cat === "search") {
 		const query = firstText(args, ["query", "pattern", "search", "term", "glob"]) || path;
 		return query ? `Search ${query}` : "Search";
@@ -226,7 +389,7 @@ function cardInfo(line: string | undefined): { failed: boolean; cat: CardCat; ad
 	const m = plain.match(CARD_RE);
 	if (!m) return null;
 	const prefix = m[2];
-	const cat: CardCat = prefix.startsWith("$")
+	const cat: CardCat = prefix.startsWith("Run")
 		? "cmd"
 		: prefix.startsWith("Read")
 			? "read"
@@ -238,8 +401,8 @@ function cardInfo(line: string | undefined): { failed: boolean; cat: CardCat; ad
 }
 
 /** Merge runs of adjacent same-category cards (separated only by blank lines):
- *  `◈ Ran N commands[, M failed] ▸`, `◈ Read N files ▸`,
- *  `◈ Edited N files +ΣA -ΣD ▸` (diff stats aggregated). */
+ *  `◆ Ran N commands[, M failed]`, `◆ Read N files`,
+ *  `◆ Edited N files +ΣA -ΣD` (diff stats aggregated). */
 function mergeToolCards(lines: string[], width: number): string[] {
 	if (width < 16) return lines;
 	const out: string[] = [];
@@ -286,7 +449,7 @@ function mergeToolCards(lines: string[], width: number): string[] {
 				{ noun: `${categoryMark}${run.length}`, fail: failed ? ` F${failed}` : "", stats: "" },
 			];
 			const fits = (part: { noun: string; fail: string; stats: string }) =>
-				colWidth(`◈ ${part.noun}${part.fail}${part.stats} ▸`) <= Math.max(1, width - 1);
+				colWidth(`◆ ${part.noun}${part.fail}${part.stats}`) <= Math.max(1, width - 1);
 			const chosen = candidates.find(fits);
 			// If even the count-preserving shorthand cannot fit, retain the
 			// already bounded individual cards instead of dropping semantics.
@@ -295,12 +458,12 @@ function mergeToolCards(lines: string[], width: number): string[] {
 				i++;
 				continue;
 			}
-			const icon = semantic("dim", "◈");
+			const icon = semantic("dim", "◆");
 			const fail = chosen.fail ? semantic("error", chosen.fail) : "";
 			const stats = chosen.stats
 				? ` ${semantic("success", chosen.stats.trim().split(" ")[0])} ${semantic("error", chosen.stats.trim().split(" ")[1])}`
 				: "";
-			out.push(`${icon} ${semantic("toolOutput", chosen.noun)}${fail}${stats} ${semantic("dim", "▸")}${CARD_MARK}`);
+			out.push(`${icon} ${semantic("toolOutput", chosen.noun)}${fail}${stats}${CARD_MARK}`);
 			i = j + 1;
 		} else {
 			out.push(lines[i]);
@@ -310,9 +473,9 @@ function mergeToolCards(lines: string[], width: number): string[] {
 	return out;
 }
 
-/** Replace Pi's marked queued-steering rows with a stable summary rail. The
- *  blank status/widget rows move above it, so the rail sits against the next
- *  visible surface (normally the composer) without changing total height. */
+/** Replace Pi's marked queued-steering rows with a stable flat diamond summary
+ *  row. The blank status/widget rows move above it, so the row sits against the
+ *  next visible surface (normally the composer) without changing total height. */
 function decoratePendingSteer(lines: string[], width: number): string[] {
 	const unmarkFrame = (line: string) => FRAME_MARKS.reduce((text, marker) => text.replaceAll(marker, ""), line);
 	const cleanFrameLines = () => lines.map(unmarkFrame);
@@ -340,28 +503,23 @@ function decoratePendingSteer(lines: string[], width: number): string[] {
 	const messages = steerRows.map((i) => stripAnsi(lines[i]).trim().slice("Steering: ".length).trim());
 	const latest = messages[messages.length - 1] ?? "";
 	const summary = messages.length > 1 ? `${messages.length} steering · ${latest}` : latest;
-	// Inset one column on each side, plus one slack column so the rail never
-	// lands on the exact terminal width (same hard-wrap guard as the composer).
-	const railWidth = Math.max(8, width - 3);
+	// Flat diamond summary row, one column short of the terminal width (same
+	// hard-wrap guard as the composer). The `◆` matches the tool rows.
+	const rowWidth = Math.max(8, width - 1);
 	const fullHint = "Enter to steer";
 	const hintWidth = colWidth(fullHint);
-	const withHintBudget = railWidth - hintWidth - 5;
+	const withHintBudget = rowWidth - hintWidth - 5;
 	const showHint = withHintBudget >= 8;
-	const messageBudget = showHint ? withHintBudget : railWidth - 4;
+	const messageBudget = showHint ? withHintBudget : rowWidth - 4;
 	const shown = colWidth(summary) > messageBudget ? truncCols(summary, messageBudget) : summary;
 	const hintStyled = showHint ? `${semantic("accent", "Enter")}${semantic("dim", " to steer")}` : "";
-	const gap = " ".repeat(Math.max(showHint ? 1 : 0, railWidth - 4 - colWidth(shown) - (showHint ? hintWidth : 0)));
-	const border = (left: string, rightCorner: string) => ` ${semantic("borderMuted", left + "─".repeat(railWidth - 2) + rightCorner)} `;
-	const content = ` ${semantic("borderMuted", "│")} ${semantic("text", shown)}${gap}${hintStyled} ${semantic("borderMuted", "│")} `;
+	const gap = " ".repeat(Math.max(showHint ? 1 : 0, rowWidth - 2 - colWidth(shown) - (showHint ? hintWidth : 0)));
+	const rail = [` ${semantic("dim", "◆")} ${semantic("text", shown)}${gap}${hintStyled}`];
 
 	let start = firstQueued;
 	if (start > 0 && stripAnsi(lines[start - 1]).trim() === "") start--;
 	let after = hint + 1;
 	while (after < lines.length && stripAnsi(lines[after]).trim() === "") after++;
-	// When the next visible line is the composer's rounded top border, let that
-	// wider edge close the inset rail. Otherwise give the rail its own bottom.
-	const attached = after < lines.length && stripAnsi(lines[after]).trimStart().startsWith("╭");
-	const rail = attached ? [border("╭", "╮"), content] : [border("╭", "╮"), content, border("╰", "╯")];
 	const secondary = followUpRows.length > 0 ? [...followUpRows.map((i) => unmarkFrame(lines[i])), unmarkFrame(lines[hint])] : [];
 	const replacedHeight = hint - start + 1 + (after - hint - 1);
 	const preservedBlanks = Math.max(0, replacedHeight - secondary.length - rail.length);
@@ -378,7 +536,7 @@ export default function ampStyle(pi: ExtensionAPI) {
 	patchToolCards();
 	patchCardGrouping();
 	patchPendingMessages();
-	patchChrome();
+	patchCanvasPaint();
 	patchEditor();
 	if (failedPatches.length) {
 		const msg = `amp-pi-style: degraded enhancements: ${failedPatches.join(", ")} — safe or stock fallbacks active`;
@@ -399,7 +557,9 @@ export default function ampStyle(pi: ExtensionAPI) {
 	}
 }
 
-/** Track live context + working status from extension events. */
+/** Snapshot render data while the event context is active. Pi deliberately
+ *  invalidates that context after `session_shutdown`, so renderers must never
+ *  retain it across a session replacement or extension reload. */
 function wireEvents(pi: ExtensionAPI) {
 	const on = (ev: string, fn: (event: any, ctx: any) => void) => {
 		try {
@@ -407,20 +567,39 @@ function wireEvents(pi: ExtensionAPI) {
 		} catch {}
 	};
 	const track = (_event: any, ctx: any) => {
-		if (ctx) lastCtx = ctx;
-		if (ctx?.thinkingLevel) thinkingLevel = ctx.thinkingLevel;
-		applyFooter(ctx);
+		if (!ctx) return;
+		try {
+			const model = ctx.model;
+			const usage = ctx.getContextUsage?.();
+			const modelName = String(model?.name ?? model?.id ?? "");
+			liveState.session = {
+				modelName,
+				modelId: String(model?.id ?? modelName)
+					.split("/")
+					.pop()!
+					.replace(/-20\d{6,8}$/, ""),
+				contextTokens: usage?.tokens ?? usage?.contextTokens ?? null,
+				contextWindow: usage?.contextWindow ?? model?.contextWindow ?? null,
+				cwd: ctx.cwd,
+				thinkingLevel: ctx.thinkingLevel ?? null,
+			};
+			applyLiveRegion(ctx);
+			applyFooter(ctx);
+		} catch {
+			// Event contexts should be active, but a lifecycle race must degrade to
+			// the last complete snapshot rather than take down Pi's render loop.
+		}
 	};
 	for (const ev of ["session_start", "turn_start", "turn_end", "model_select"]) on(ev, track);
 	on("thinking_level_select", (event, ctx) => {
 		track(event, ctx);
-		thinkingLevel = event?.level ?? thinkingLevel;
+		if (liveState.session && event?.level) liveState.session.thinkingLevel = event.level;
 	});
 
 	const activeToolNames = new Map<string, string>();
 	on("agent_start", (e, ctx) => {
 		track(e, ctx);
-		workPhase = "Thinking…";
+		liveState.workPhase = "Thinking…";
 		activeTools = 0;
 		activeToolNames.clear();
 	});
@@ -429,10 +608,10 @@ function wireEvents(pi: ExtensionAPI) {
 		const content = event?.message?.content;
 		if (!Array.isArray(content)) return;
 		const last = content[content.length - 1];
-		workPhase = last?.type === "thinking" ? "Thinking…" : last?.type === "toolCall" ? "Working…" : "Responding…";
+		liveState.workPhase = last?.type === "thinking" ? "Thinking…" : last?.type === "toolCall" ? "Working…" : "Responding…";
 	});
 
-	// Detailed tool activity has one stable home in the editor's bottom border:
+	// Detailed tool activity has one stable home in the turn-status widget:
 	// `⠋ Searching 1 pattern…`, `⠋ Running 2 commands…`, `⠋ Editing 1 file…`.
 	const activityPhrase = (names: string[]): string => {
 		const n = names.length;
@@ -456,7 +635,7 @@ function wireEvents(pi: ExtensionAPI) {
 		const id = event?.toolCallId ?? event?.id ?? `t${activeToolNames.size + 1}`;
 		activeToolNames.set(String(id), event?.toolName ?? event?.name ?? "tool");
 		activeTools = activeToolNames.size;
-		workPhase = activityPhrase([...activeToolNames.values()]);
+		liveState.workPhase = activityPhrase([...activeToolNames.values()]);
 	});
 	on("tool_execution_end", (event, _ctx) => {
 		const id = event?.toolCallId ?? event?.id;
@@ -466,18 +645,26 @@ function wireEvents(pi: ExtensionAPI) {
 			if (first !== undefined) activeToolNames.delete(first);
 		}
 		activeTools = activeToolNames.size;
-		workPhase = activeTools === 0 ? "Thinking…" : activityPhrase([...activeToolNames.values()]);
+		liveState.workPhase = activeTools === 0 ? "Thinking…" : activityPhrase([...activeToolNames.values()]);
 	});
 	on("agent_end", (e, ctx) => {
 		track(e, ctx);
-		workPhase = null;
+		liveState.workPhase = null;
 		activeTools = 0;
 		activeToolNames.clear();
-		ctxUsageCache.at = 0;
+	});
+	on("session_shutdown", () => {
+		liveState.session = null;
+		liveState.workPhase = null;
+		liveState.activeTheme = null;
+		activeTools = 0;
+		activeToolNames.clear();
+		liveRegionApplied = false;
+		footerApplied = false;
 	});
 }
 
-/** User messages: compact raised prompt band with a Grok-style arrow. */
+/** User messages: canvas-flat prompt row with Grok's vertical rhythm and arrow. */
 function patchUserMessages() {
 	const proto = UserMessageComponent?.prototype as any;
 	if (!proto) return guard("userMessages", false);
@@ -495,7 +682,7 @@ function patchUserMessages() {
 			origRebuild.call(this);
 			const box = this.contentBox ?? this.children?.[0];
 			if (box && typeof box.paddingY === "number") {
-				box.paddingY = 0;
+				box.paddingY = 1;
 				box.invalidateCache?.();
 			}
 			const md = box?.children?.[0];
@@ -510,8 +697,8 @@ function patchUserMessages() {
 		proto.render = function (width: number) {
 			if (width < 4) return origRender.call(this, width);
 			const box = this.contentBox ?? this.children?.[0];
-			if (box && typeof box.paddingY === "number" && box.paddingY !== 0) {
-				box.paddingY = 0;
+			if (box && typeof box.paddingY === "number" && box.paddingY !== 1) {
+				box.paddingY = 1;
 				box.invalidateCache?.();
 			}
 			const md = box?.children?.[0];
@@ -522,18 +709,21 @@ function patchUserMessages() {
 			// The box keeps its one-column left padding. Prefix one external
 			// column and reserve one right-side slack column to avoid hard wraps.
 			const lines = origRender.call(this, width - 2);
-			const colorFn = md?.defaultTextStyle?.color;
 			const bgFn = box?.bgFn;
 			const paint = (text: string) => (typeof bgFn === "function" ? bgFn(text) : text);
-			const arrow = paint(typeof colorFn === "function" ? colorFn("❯") : "❯");
+			const arrow = paint(semantic("toolTitle", "❯"));
 			const indent = paint(" ");
-			return lines.map((line: string, index: number) => afterLeadingOsc(line, index === 0 ? arrow : indent));
+			const firstContent = Math.max(
+				0,
+				lines.findIndex((line: string) => stripAnsi(line).trim().length > 0),
+			);
+			return lines.map((line: string, index: number) => afterLeadingOsc(line, index === firstContent ? arrow : indent));
 		};
 	}
 }
 
-/** Assistant messages: no leading blank line. Pi remains the source of truth
- *  for streaming arguments and reversible thinking visibility. */
+/** Assistant messages: no leading blank line. Thinking keeps Pi's reversible
+ *  visibility behavior, but renders as Grok's quiet header + accent rail. */
 function patchAssistantMessages() {
 	const proto = AssistantMessageComponent?.prototype as any;
 	if (!proto) return guard("assistantMessages", false);
@@ -549,10 +739,34 @@ function patchAssistantMessages() {
 		if (first?.constructor?.name === "Spacer") {
 			cc.removeChild(first);
 		}
+
+		const lastVisible = [...(message?.content ?? [])]
+			.reverse()
+			.find((content: any) => content?.type === "toolCall" || (content?.type === "text" && content.text?.trim()) || (content?.type === "thinking" && content.thinking?.trim()));
+		const thinkingRunning = Boolean(this.isStreaming && lastVisible?.type === "thinking");
+		for (const child of cc?.children ?? []) {
+			const hiddenLabel = String(this.hiddenThinkingLabel ?? "Thinking...");
+			const isThinking = child?.defaultTextStyle?.italic === true || stripAnsi(String(child?.text ?? "")).trim() === hiddenLabel;
+			if (!isThinking || child.__ampThinking) continue;
+			const origRender = child.render;
+			if (typeof origRender !== "function") continue;
+			child.__ampThinking = true;
+			child.render = function (width: number) {
+				if (width < 6) return origRender.call(this, width);
+				const body: string[] = origRender.call(this, Math.max(1, width - 3));
+				const label = this.__ampThinkingRunning ? "Thinking…" : "Thought";
+				const header = hardTrim(`${semantic("accent", "◆")} ${strong(semantic("muted", label))}`, width - 1);
+				if (stripAnsi(String(this.text ?? "")).trim() === String(this.__ampHiddenThinkingLabel ?? "")) return [header];
+				const rail = semantic("dim", "┃");
+				return [header, ...body.map((line) => afterLeadingOsc(line, `${rail} `))];
+			};
+			child.__ampThinkingRunning = thinkingRunning;
+			child.__ampHiddenThinkingLabel = String(this.hiddenThinkingLabel ?? "Thinking...");
+		}
 	};
 }
 
-/** Tool calls: Grok-inspired operation-first cards when collapsed; ctrl+o expands. */
+/** Tool calls: Grok's diamond activity rail when collapsed; ctrl+o expands. */
 function patchToolCards() {
 	const proto = ToolExecutionComponent?.prototype as any;
 	if (!proto) return guard("toolCards", false);
@@ -565,12 +779,10 @@ function patchToolCards() {
 		if (this.expanded || this.hideComponent || width < 8) return origRender.call(this, width);
 
 		const name = String(this.toolName ?? "tool");
-		const a = this.args ?? {};
-		const text = toolSummary(name, a);
+		const text = toolSummary(name, this.args ?? {});
 
-		// Diff stats for edit-type tools. Pi's built-in edit keeps its display diff
-		// in result.details.diff; text output is only a success sentence. Fall back
-		// to text for compatible custom edit tools that return a unified diff.
+		// Pi's edit tool stores its display diff in result.details.diff. Compatible
+		// custom tools may instead return a unified diff as text.
 		let stats = "";
 		let statsPlain = "";
 		if (EDIT_TOOLS.has(name.toLowerCase())) {
@@ -590,21 +802,24 @@ function patchToolCards() {
 			} catch {}
 		}
 
-		const err = this.result?.isError === true;
-		const spinFrame = ACTIVITY_SPIN[Math.floor(Date.now() / 135) % ACTIVITY_SPIN.length];
-		const iconPlain = this.isPartial ? spinFrame : err ? "✗" : "";
-		const icon = iconPlain ? semantic(this.isPartial ? "accent" : "error", iconPlain) : "";
-		const prefix = icon ? `${icon} ` : "";
-		// Impact statistics yield before the primary action or target is shortened.
-		const chromeWidth = 2 + colWidth(iconPlain) + (iconPlain ? 1 : 0);
+		const running = this.isPartial === true;
+		const failed = this.result?.isError === true;
+		const iconPlain = running ? "·" : failed ? "✗" : "◆";
+		const icon = semantic(running ? "accent" : failed ? "error" : "toolOutput", iconPlain);
+		const chromeWidth = colWidth(iconPlain) + 1;
 		if (statsPlain && colWidth(text) + colWidth(statsPlain) + chromeWidth > width - 1) {
 			stats = "";
 			statsPlain = "";
 		}
-		const budget = Math.max(1, width - 3 - colWidth(iconPlain) - (iconPlain ? 1 : 0) - colWidth(statsPlain));
+		const budget = Math.max(1, width - chromeWidth - colWidth(statsPlain) - 1);
 		const shownText = colWidth(text) > budget ? truncCols(text, budget) : text;
-		const marker = framePassReady ? CARD_MARK : "";
-		return ["", `${prefix}${semantic("toolOutput", shownText)}${stats} ${semantic("dim", "▸")}${marker}`];
+		const split = shownText.indexOf(" ");
+		const verb = split < 0 ? shownText : shownText.slice(0, split);
+		const detail = split < 0 ? "" : shownText.slice(split);
+		const textRole = running ? "text" : "toolOutput";
+		const styledText = strong(semantic(textRole, verb)) + semantic(textRole, detail);
+		const marker = !running && liveState.framePassReady ? CARD_MARK : "";
+		return ["", `${icon} ${styledText}${stats}${marker}`];
 	};
 }
 
@@ -644,27 +859,49 @@ function patchPendingMessages() {
 		textProto.__ampStylePending = true;
 		textProto.render = function (width: number) {
 			const lines: string[] = origRender.call(this, width);
-			const marker = framePassReady ? String(this.__ampQueueMarker ?? "") : "";
+			const marker = liveState.framePassReady ? String(this.__ampQueueMarker ?? "") : "";
 			return marker && lines.length === 1 ? [lines[0] + marker] : lines;
 		};
 	}
 }
 
-/** Fill the flexible space immediately before the active composer so the
- *  lower frame ends at the terminal bottom. Pi's normal bottom viewport takes
- *  over once content is taller than the terminal. Exactly one marker is
- *  required: dialogs, replaced editors, and incompatible internals stay stock. */
+/** Fill the flexible space before Grok's complete live region so status,
+ *  prompt, and footer stay together at the terminal bottom. Pi's normal bottom
+ *  viewport takes over once content is taller than the terminal. */
 function pinComposer(lines: string[], terminalRows: number): string[] {
 	if (!PIN_COMPOSER || !Number.isFinite(terminalRows) || terminalRows <= 0 || lines.length >= terminalRows) {
 		return lines;
 	}
+	const liveRows: number[] = [];
 	const composers: number[] = [];
 	for (let i = 0; i < lines.length; i++) {
+		if (lines[i].includes(LIVE_MARK)) liveRows.push(i);
 		if (lines[i].includes(COMPOSER_MARK)) composers.push(i);
 	}
-	if (composers.length !== 1) return lines;
+	const anchors = liveRows.length === 1 ? liveRows : composers;
+	if (anchors.length !== 1) return lines;
 	const fill = terminalRows - lines.length;
-	return [...lines.slice(0, composers[0]), ...Array(fill).fill(""), ...lines.slice(composers[0])];
+	return [...lines.slice(0, anchors[0]), ...Array(fill).fill(""), ...lines.slice(anchors[0])];
+}
+
+/** Wrap the fullscreen root once with symmetric fixed gutters. Applying this
+ *  at the layout level gives every child the same narrower wrap width and keeps
+ *  selection, scrolling, overlays, transcript, and dock geometry coherent. */
+function applyFullscreenGutter(tui: any): boolean {
+	if (tui?.mode !== "fullscreen") return true;
+	const root = tui.layoutRoot;
+	if (root?.__ampStyleGutter) return true;
+	if (typeof HStack !== "function" || !root || typeof tui.setLayoutRoot !== "function") return false;
+	const blank = () => ({ render: () => [""], invalidate() {} });
+	const showGutter = ({ width }: { width: number }) => width >= 12;
+	const wrapped = new HStack([
+		{ component: blank(), basis: SCREEN_GUTTER, grow: 0, shrink: 0, minSize: SCREEN_GUTTER, visible: showGutter },
+		{ component: root, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+		{ component: blank(), basis: SCREEN_GUTTER, grow: 0, shrink: 0, minSize: SCREEN_GUTTER, visible: showGutter },
+	]);
+	wrapped.__ampStyleGutter = true;
+	tui.setLayoutRoot(wrapped);
+	return true;
 }
 
 /** Final TUI pass: merge adjacent tool cards, anchor the optional composer,
@@ -700,7 +937,9 @@ function patchCardGrouping() {
 						};
 					}
 				}
-				return origMount.call(this, tui, components);
+				const result = origMount.call(this, tui, components);
+				applyFullscreenGutter(tui);
+				return result;
 			};
 		} else {
 			guard("fullscreenFrame", false);
@@ -730,7 +969,53 @@ function patchCardGrouping() {
 		patched = true;
 	}
 	guard("cardGrouping", patched);
-	framePassReady = patched;
+	guard("fullscreenGutter", typeof HStack === "function");
+	liveState.framePassReady = patched;
+}
+
+/** Paint the fullscreen frame onto an opaque canvas so the Grok look survives
+ *  translucent terminals and foreign themes. Wraps `TuiAltScreen.doRender` and,
+ *  while it runs, intercepts the single per-frame `terminal.write` to fill every
+ *  rewritten row. Unchanged rows keep their painted state; inline main-screen
+ *  mode is untouched so scrollback never fills with colored blocks. Missing or
+ *  renamed internals degrade to terminal-inheriting (stock) rendering. */
+function patchCanvasPaint() {
+	const proto = TuiAltScreen?.prototype as any;
+	if (!proto) {
+		guard("canvasPaint", false);
+		return;
+	}
+	if (proto.__ampStyleCanvas) return;
+	const origDoRender = proto.doRender;
+	if (typeof origDoRender !== "function") {
+		guard("canvasPaint", false);
+		return;
+	}
+	proto.__ampStyleCanvas = true;
+	proto.doRender = function (this: any) {
+		applyFullscreenGutter(this);
+		const term = this.terminal;
+		const origWrite = term?.write;
+		if (typeof origWrite !== "function") return origDoRender.call(this);
+		const nextCanvas = canvasAnsi();
+		if (this.__ampCanvasAnsi !== nextCanvas) {
+			// Pi's alternate-screen renderer is differential. Force one full frame
+			// whenever the canvas changes (including known theme → inheritance),
+			// otherwise unchanged blank rows retain the previous background.
+			this.__ampCanvasAnsi = nextCanvas;
+			this.previousScreen = [];
+			this.previousScreenWidth = 0;
+			this.previousScreenHeight = 0;
+		}
+		term.write = (buffer: unknown) => {
+			origWrite.call(term, paintScreenBuffer(String(buffer), Math.max(1, this.terminal?.columns ?? 80), nextCanvas));
+		};
+		try {
+			return origDoRender.call(this);
+		} finally {
+			term.write = origWrite;
+		}
+	};
 }
 
 /** Status keys hidden from the footer. `cursor` (pi-cursor-sdk's
@@ -738,11 +1023,85 @@ function patchCardGrouping() {
  *  editor border. */
 const HIDDEN_STATUS_KEYS = new Set(["cursor"]);
 
-/** Replace the stock footer via the official `ctx.ui.setFooter` API: only
- *  extension status lines (`ctx.ui.setStatus`) remain, dimmed, minus
- *  `HIDDEN_STATUS_KEYS` — path/model/context already live in the editor
- *  border. Runs once, on the first event whose context has a UI; degrades to
- *  the stock footer if the API is missing. */
+let liveRegionApplied = false;
+/** Install Grok's dedicated turn-status row as Pi's official above-editor
+ *  widget. It owns the only activity spinner and its repaint timer, and leaves
+ *  a stable prompt gap. The stock working indicator is disabled through Pi's
+ *  official API (retry/compaction rows stay stock). Runs once per session;
+ *  the session_shutdown handler resets it so the widget reinstalls for the
+ *  next session. */
+function applyLiveRegion(ctx: any) {
+	if (liveRegionApplied || !ctx?.hasUI) return;
+	if (typeof ctx.ui?.setWidget !== "function" || typeof ctx.ui?.setWorkingVisible !== "function") {
+		try {
+			ctx.ui?.notify?.("amp-pi-style: setWidget/setWorkingVisible unavailable — stock working indicator kept", "warning");
+		} catch {}
+		return;
+	}
+	liveRegionApplied = true;
+	try {
+		ctx.ui.setWorkingVisible(false);
+		ctx.ui.setWorkingIndicator?.({ frames: [] });
+		ctx.ui.setWidget(
+			"amp-style-live",
+			(tui: any, theme: any) => {
+				liveState.activeTheme = theme;
+				let timer: ReturnType<typeof setInterval> | null = null;
+				const stopTimer = () => {
+					if (timer) {
+						clearInterval(timer);
+						timer = null;
+					}
+				};
+				return {
+					invalidate() {
+						liveState.activeTheme = theme;
+					},
+					render(width: number) {
+						const phase = liveState.workPhase;
+						// The pin pass only runs on main-screen TUIs; fullscreen
+						// bottom-aligns its own dock, so the anchor mark would leak.
+						const mark = tui?.mode === "fullscreen" ? "" : LIVE_MARK;
+						if (phase && !timer) {
+							timer = setInterval(() => {
+								try {
+									tui?.requestRender?.();
+								} catch {}
+							}, 135);
+						} else if (!phase && timer) {
+							stopTimer();
+						}
+						if (!phase) {
+							// Stable 1-row prompt gap so the editor never jumps.
+							return [` ${mark}`];
+						}
+						const frame = ACTIVITY_SPIN[Math.floor(Date.now() / 135) % ACTIVITY_SPIN.length];
+						const text = ` ${semantic("accent", frame)} ${semantic("muted", phase)}`;
+						const fitted = hardTrim(text, Math.max(1, width - 1));
+						return [`${fitted}${mark}`];
+					},
+					dispose() {
+						stopTimer();
+					},
+				};
+			},
+			{ placement: "aboveEditor" },
+		);
+	} catch {
+		liveRegionApplied = false;
+		try {
+			// Restore the stock indicator so a widget failure never leaves a gap.
+			ctx.ui.setWorkingIndicator?.();
+			ctx.ui.setWorkingVisible(true);
+			ctx.ui?.notify?.("amp-pi-style: live region widget failed — stock working indicator kept", "warning");
+		} catch {}
+	}
+}
+
+/** Replace the stock footer via the official `ctx.ui.setFooter` API with a
+ *  separate agent-status row: abbreviated cwd/git at the left, context usage
+ *  and extension statuses at the right. It never shares the prompt border.
+ *  Runs once per session; degrades to the stock footer if the API is missing. */
 let footerApplied = false;
 function applyFooter(ctx: any) {
 	if (footerApplied || !ctx?.hasUI) return;
@@ -754,25 +1113,28 @@ function applyFooter(ctx: any) {
 	}
 	try {
 		ctx.ui.setFooter((_tui: any, theme: any, footerData: any) => {
-			activeTheme = theme;
+			liveState.activeTheme = theme;
 			return {
 				invalidate() {},
 				render(width: number) {
-				try {
-					const statuses = footerData?.getExtensionStatuses?.();
-					if (!statuses?.size) return [];
-					const text = [...statuses.entries()]
-						.filter(([key]) => !HIDDEN_STATUS_KEYS.has(key))
-						.sort(([a], [b]) => a.localeCompare(b))
-						.map(([, t]) => String(t).replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
-						.filter(Boolean)
-						.join(" ");
-					const fitted = hardTrim(text, width);
-					return fitted ? [theme?.fg?.("dim", fitted) ?? fitted] : [];
-				} catch {
-					return [];
-				}
-			},
+					try {
+						if (width < 12) return [];
+						const branch = footerData?.getGitBranch?.() ?? "";
+						const cwd = displayPath(Math.max(8, Math.floor(width * 0.4)));
+						const left = [cwd, branch ? `⭠ ${branch}` : ""].filter(Boolean).join("  ");
+						const pct = contextPercent() ?? "";
+						const statuses = [...(footerData?.getExtensionStatuses?.() ?? new Map()).entries()]
+							.filter(([key]) => !HIDDEN_STATUS_KEYS.has(key))
+							.sort(([a], [b]) => a.localeCompare(b))
+							.map(([, t]) => String(t).replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
+							.filter(Boolean);
+						const rightItems = [pct, ...statuses].map((item) => semantic("dim", item));
+						const line = statusLine(semantic("dim", left), rightItems, width);
+						return line ? [line] : [];
+					} catch {
+						return [];
+					}
+				},
 			};
 		});
 		footerApplied = true;
@@ -783,32 +1145,9 @@ function applyFooter(ctx: any) {
 	}
 }
 
-/** Hide the stock `Working...` spinner line — its info lives in the editor
- *  border. Retry/compaction loaders stay visible. Kept as a prototype patch on
- *  purpose: `setWorkingVisible(false)` would skip creating the working loader,
- *  and with it the animation timer whose `requestRender` repaints our border
- *  spinner between stream events. */
-function patchChrome() {
-	const loaderProto = Loader?.prototype as any;
-	if (!loaderProto) {
-		guard("loader", false);
-	} else if (!loaderProto.__ampStyle) {
-		loaderProto.__ampStyle = true;
-		const origRender = loaderProto.render;
-		if (typeof origRender !== "function") {
-			guard("loader", false);
-		} else {
-			loaderProto.render = function (width: number) {
-				// Keep the 2-line height of the visible loader — collapsing to zero
-				// lines makes the layout flap while working and leaves ghosts.
-				if ((this as any).kind === "working") return ["", ""];
-				return origRender.call(this, width);
-			};
-		}
-	}
-}
-
-/** Editor: rounded Pi adaptation with Grok-like live activity in the border. */
+/** Editor: rounded Pi adaptation with Grok's quiet prompt and live state in
+ *  the divider. Activity lives in the turn-status widget; cwd/git live in the
+ *  footer — the prompt border itself stays quiet. */
 function patchEditor() {
 	const proto = CustomEditor?.prototype as any;
 	if (!proto) return guard("editor", false);
@@ -828,14 +1167,24 @@ function patchEditor() {
 	};
 	proto.render = function (width: number) {
 		if (width < 24) return markComposer(this, baseRender.call(this, width));
-		// 2 side borders + 1 slack column. Hitting the exact terminal width makes
-		// Ghostty/iTerm auto-wrap the final cell onto the next row, so the bottom
-		// border and cursor line collide with wrapped composer text.
+		// `│ ❯ ` input prefix + `│` right border + 1 slack column. Hitting the
+		// exact terminal width makes Ghostty/iTerm auto-wrap the final cell onto
+		// the next row, so the bottom border and cursor line collide with wrapped
+		// composer text.
 		const boxWidth = width - 1;
-		const lines: string[] = baseRender.call(this, boxWidth - 2);
+		const lines: string[] = baseRender.call(this, boxWidth - 5);
 		if (lines.length < 2) return markComposer(this, lines);
 
-		const bc = typeof this.borderColor === "function" ? this.borderColor : (s: string) => s;
+		// Quiet active/idle borders: accent when focused, muted when idle.
+		const bc = (s: string): string => {
+			try {
+				const fg = liveState.activeTheme?.fg;
+				const role = this.focused ? "borderAccent" : "borderMuted";
+				return typeof fg === "function" ? fg.call(liveState.activeTheme, role, s) : (typeof this.borderColor === "function" ? this.borderColor(s) : s);
+			} catch {
+				return typeof this.borderColor === "function" ? this.borderColor(s) : s;
+			}
+		};
 
 		// Bottom border: last line that is a pure border (starts with ─).
 		// Lines after it (autocomplete) get indented instead of side-bordered.
@@ -851,7 +1200,7 @@ function patchEditor() {
 		const scrollInfo = (line: string) => stripAnsi(line).match(/[↑↓] \d+ more/)?.[0] ?? "";
 
 		/** Corner + low-volume labels + fill + corner, always exactly `boxWidth`
-		 *  columns. Right-side metadata yields before the current activity. */
+		 *  columns. Right-side metadata yields before the left scroll indicator. */
 		const makeBorder = (leftCorner: string, rightCorner: string, origLine: string, leftLabel = "", rightLabel = "") => {
 			const scroll = scrollInfo(origLine);
 			let left = [scroll, leftLabel].filter(Boolean).join(" · ");
@@ -875,42 +1224,23 @@ function patchEditor() {
 			return osc + bc(leftCorner) + leftStyled + bc("─".repeat(fill)) + rightStyled + bc(rightCorner);
 		};
 
-		// Top border: whole labels disappear by priority instead of tail-truncating
-		// into ambiguous model or metric fragments at narrow widths.
-		const model = lastCtx?.getModel?.() ?? lastCtx?.model;
-		const modelName = String(model?.name ?? model?.id ?? "");
-		const modelId = String(model?.id ?? modelName)
-			.split("/")
-			.pop()!
-			.replace(/-20\d{6,8}$/, "");
-		const pct = contextPercent() ?? "";
-		const level = String(lastCtx?.getThinkingLevel?.() ?? thinkingLevel ?? "");
-		const availableTop = Math.max(0, boxWidth - 6 - (scrollInfo(lines[0]) ? colWidth(scrollInfo(lines[0])) + 3 : 0));
-		const join = (values: string[], separator: string) => values.filter(Boolean).join(separator);
-		const topCandidates = [
-			join([modelName, pct, level], " ─ "),
-			join([modelName, pct, level], " · "),
-			join([modelName, level], " · "),
-			join([modelId, level], " · "),
-			level,
-		];
-		const topLabel = topCandidates.find((candidate) => candidate && colWidth(candidate) <= availableTop) ?? "";
-		lines[0] = makeBorder("╭", "╮", lines[0], "", topLabel);
+		// Top border: quiet — no metadata, only the scroll indicator.
+		lines[0] = makeBorder("╭", "╮", lines[0]);
 
-		// Bottom border: current activity owns the left; cwd uses only the
-		// remaining right-side budget and keeps meaningful path endpoints.
-		const status = workPhase ?? "";
-		const frame = ACTIVITY_SPIN[Math.floor(Date.now() / 135) % ACTIVITY_SPIN.length];
-		const activity = status ? `${frame} ${status}` : "";
-		const leftWidth = activity ? colWidth(activity) + 3 : 0;
-		const pathBudget = Math.min(Math.floor(boxWidth / 2), Math.max(0, boxWidth - 6 - leftWidth));
-		const path = pathBudget >= 8 ? displayPath(pathBudget) : "";
-		lines[bottom] = makeBorder("╰", "╯", lines[bottom], activity, path);
+		// Bottom border: only model/mode information in its divider. Context
+		// usage lives in the footer, activity in the turn-status widget.
+		const modelName = liveState.session?.modelName ?? "";
+		const modelId = liveState.session?.modelId ?? modelName;
+		const level = liveState.session?.thinkingLevel ?? "";
+		const mode = [modelId, level].filter(Boolean).join(" ─ ");
+		lines[bottom] = makeBorder("╰", "╯", lines[bottom], "", mode);
 
+		// Content lines: `│ ❯ ` input prefix, `│   ` aligned continuations,
+		// and a `│` right border. Autocomplete stays indented below the box.
 		for (let i = 1; i < lines.length; i++) {
 			if (i === bottom) continue;
-			if (i < bottom) lines[i] = afterLeadingOsc(lines[i], bc("│")) + bc("│");
-			else lines[i] = afterLeadingOsc(lines[i], "  ");
+			if (i < bottom) lines[i] = afterLeadingOsc(lines[i], i === 1 ? `${bc("│")} ❯ ` : `${bc("│")}   `) + bc("│");
+			else lines[i] = afterLeadingOsc(lines[i], "   ");
 		}
 		return markComposer(this, lines);
 	};

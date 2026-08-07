@@ -28,7 +28,7 @@
 
 ## 一、Agent TUI 真正设计的是注意力
 
-Grok Build 的深色背景、`❯`、Braille spinner、`◈`、`✗`、`▸` 和紧凑工具行只是表层。真正需要设计的是用户在一次长时间 Agent 运行中的注意力分配：
+Grok Build 的深色背景、`❯`、Braille spinner、`◆`、`✗` 和紧凑工具行只是表层。真正需要设计的是用户在一次长时间 Agent 运行中的注意力分配：
 
 ```text
 第一层：现在发生了什么？
@@ -90,9 +90,9 @@ Amp 不把对话渲染成聊天软件里左右对齐的气泡，而更接近工�
 最嘈杂的信息——工具调用、推理、命令输出和 diff——应默认折叠为摘要：
 
 ```text
-Read src/config.ts ▸
-Edit src/config.ts +5 -1 ▸
-✗ $ npm test ▸
+◆ Read src/config.ts
+◆ Edit src/config.ts +5 -1
+✗ Run npm test
 ```
 
 一张合格的工具摘要应在不展开的情况下回答：
@@ -101,7 +101,7 @@ Edit src/config.ts +5 -1 ▸
 2. 做了什么；
 3. 对什么做；
 4. 影响有多大；
-5. 是否可以查看更多。
+5. 是否可以查看更多（`ctrl+o` 展开）。
 
 完整日志和参数仍应保留，但只在用户主动展开时出现。
 
@@ -110,17 +110,17 @@ Edit src/config.ts +5 -1 ▸
 Agent 一次任务可能连续读取或编辑许多文件。逐条保留会让用户失去整体感，同类连续动作应提升为工作摘要：
 
 ```text
-◈ Read 8 files ▸
-◈ Ran 5 commands ▸
-◈ Ran 15 commands · 2 failed ▸
-◈ Edited 4 files +83 -17 ▸
+◆ Read 8 files
+◆ Ran 5 commands
+◆ Ran 15 commands · 2 failed
+◆ Edited 4 files +83 -17
 ```
 
 语义压缩不是简单地“少显示”，而是把事件序列提升为工作摘要。
 
 ```text
 不够好：Done
-更好：  ◈ Read 4 files ▸
+更好：  ◆ Read 4 files
 ```
 
 摘要不能丢失动作类型、对象规模和失败数量。
@@ -217,16 +217,19 @@ Amp 不要求用户先知道哪个模型适合哪个任务，而是询问更贴�
 
 ## 三、视觉语法
 
-### 1. 画布：继承终端，而不是占领终端
+### 1. 画布：fullscreen 接管终态，所有普通内容共享一种底色
 
-背景不应成为最突出的品牌元素。尽量继承用户终端背景，可以：
+这套插件的第一视觉签名不是卡片，而是一整块连续的冷黑哑光工作面。fullscreen 模式下，扩展在 TUI 最终帧统一绘制 `vars.canvas`：每个被改写的 cell、ANSI reset 后的片段和行尾剩余宽度都重新落回同一底色。这样即使终端透明、模糊或使用异色主题，transcript、prompt 与 footer 之间也不会出现壁纸渗漏或终端默认色“破洞”。
 
-- 适配现有终端主题；
-- 保持 CLI 与 shell 的连续感；
-- 避免出现突兀的矩形应用区域；
-- 降低颜色兼容问题。
+普通内容不建立独立 surface：
 
-品牌应主要通过强调色、符号、节奏和行为表达，而不是强行覆盖用户环境。
+- 用户消息、assistant 正文、thinking、工具摘要、live status、composer 内部和 footer 共用 canvas；
+- selection、overlay、视觉选择和语义 diff 是少数允许抬升的表面；
+- focus 不切换背景，只把中性 prompt border 从 `#323237` 提升到 `#505058`；
+- inline 模式继续继承终端，避免向 shell scrollback 写入整行底色；
+- `AMP_PI_CANVAS=#…` 覆盖 canvas，`AMP_PI_CANVAS=0` 恢复终端继承。
+
+统一画布不是把所有内容压成同一层。层级改由前景灰阶、字重、符号、缩进和稳定空白承担。品牌也主要通过这些要素表达，而不是通过一堆略有不同的黑色矩形。
 
 ### 2. 色彩：角色优先于色值
 
@@ -283,7 +286,7 @@ error           仅异常时
 ❯ 帮我修复认证状态竞争问题
 ```
 
-`❯` 建立输入身份，raised band 建立任务边界，不再需要气泡、头像或 `YOU` 标签；换行继续与正文起始列对齐。
+`❯` 建立输入身份，垂直节奏建立任务边界，不再需要气泡、头像、`YOU` 标签或另一块背景；换行继续与正文起始列对齐。
 
 ### 4. 空间：紧凑不等于拥挤
 
@@ -299,6 +302,7 @@ Agent 正文
 下一段正文
 ```
 
+- fullscreen 根布局统一保留左右各 2 列 gutter，transcript 与 dock 共用基线；
 - 同一语义块内部不留多余空行。
 - 不同语义块之间固定留一行。
 - 展开详情内部使用缩进，而不是继续堆空白。
@@ -311,16 +315,16 @@ Agent 正文
 |---|---|
 | `❯` | 用户输入 |
 | `⠋` / `⠙` / `⠹` | 正在思考或执行 |
-| `◈` | 已聚合的一组工作 |
+| `◆` | 已完成的一组工具或一个已聚合的工作摘要 |
+| `┃` | 展开中的思考正文（`ctrl+t` 切换可见性） |
 | `✗` | 失败 |
-| `▸` | 可展开详情 |
 | `+N` | 新增 |
 | `-N` | 删除 |
 | `…` | 截断或省略路径 |
 | `↑ N more` | 上方还有内容 |
 | `↓ N more` | 下方还有内容 |
 
-核心状态不应依赖 Emoji。Emoji 的宽度、颜色和平台渲染不可控。
+核心状态不应依赖 Emoji。Emoji 的宽度、颜色和平台渲染不可控。`ctrl+o` 是展开工具详情的统一手势，不需要在每个摘要行上常驻 `▸` 提示符。
 
 ---
 
@@ -334,7 +338,7 @@ Agent 正文
 
 职责：建立任务边界。
 
-- 使用 `❯` prompt arrow 和一条低对比 raised band；
+- 使用 `❯` prompt arrow 和上下留白，不使用独立消息底色；
 - 正文使用常规字形；
 - 自动换行时使用两列对齐缩进；
 - 与 assistant output 保留一个空行。
@@ -363,7 +367,7 @@ Agent 正文
 ⠋ Editing 2 files…
 ```
 
-职责：回答“现在正在做什么”。Activity 文案应使用“动词 + 对象 + 数量”，而不是泄漏内部工具名。
+职责：回答“现在正在做什么”。Activity 文案应使用“动词 + 对象 + 数量”，而不是泄漏内部工具名。运行时它出现在编辑器上方的 turn-status 行，空闲时该行保持一个稳定的空行，避免编辑器上下跳动。
 
 ```text
 不够好：Running finder
@@ -373,9 +377,9 @@ Agent 正文
 ### 4. Tool Summary Card
 
 ```text
-Read src/auth.ts ▸
-Edit src/auth.ts +12 -4 ▸
-✗ $ npm test ▸
+◆ Read src/auth.ts
+◆ Edit src/auth.ts +12 -4
+✗ Run npm test
 ```
 
 职责：压缩执行历史。
@@ -383,30 +387,29 @@ Edit src/auth.ts +12 -4 ▸
 ```text
 Pending → Running → Completed
                   └→ Failed  ✗
-
-Success / Failed → Expanded details
 ```
 
-运行态、成功态和失败态应尽量保持相同高度。
+运行态、成功态和失败态应尽量保持相同高度。`◆` 标记已完成行，运行行使用静态圆点，把唯一的 Braille spinner 留给 turn-status 行；失败保留 `✗`。`ctrl+o` 统一展开为完整诊断详情。
 
 ### 5. Composer
 
-Composer 是用户注意力的重置点，可以把边框空间同时用作低响度状态带：
+Composer 是用户注意力的重置点，但只保留最低响度的状态带。运行状态和位置不占用输入边框——活动移到 turn-status 行，cwd/git 移到 footer，边框只保留模型与思考模式：
 
 ```text
-╭────────────────────────── model ─ 18% ─ high ─╮
-│ 下一条指令……                                     │
-╰─ ⠋ Thinking… ─────────────────── ~/repo/app ─╯
+⠋ Editing 2 files…
+╭────────────────────────────────────────╮
+│ ❯ 下一条指令……                          │
+╰─ claude-sonnet-4 ─ high ───────────────╯
+~/repo/app ⭠ main           18%  ext status
 ```
 
 关键规则：
 
-- 中心始终是输入；
-- 上边界承载配置和资源状态；
-- 下边界承载运行状态和当前位置；
-- 空闲时边界安静，运行时获得生命力；
-- 空间不足时低优先级信息先消失；
-- 右侧标签应为主要输入和左侧运行状态让位。
+- 中心始终是输入，`❯` 标识输入行；
+- 边框空闲时使用 `#323237`，聚焦时只提升到中性 `#505058`，不调用 accent；
+- 下边界只承载模型/模式信息；
+- 运行状态有且只有一个住所：编辑器上方的 turn-status 行；
+- 空间不足时低优先级信息先消失，footer 从右侧逐项丢弃。
 
 ### 6. Command Palette
 
@@ -601,7 +604,7 @@ type UIEvent =
 read    → Read <path>
 edit    → Edit <path> +N -M
 write   → Write <path> +N -M
-bash    → $ <first command line>
+bash    → Run <first command line>
 search  → Search <query>
 other   → <tool> <short description>
 ```
