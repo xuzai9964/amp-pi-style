@@ -1,12 +1,12 @@
 /**
- * amp-pi-style — Amp-inspired look & feel for the pi coding agent. Purely visual.
+ * amp-pi-style — Grok-informed look & feel for the pi coding agent. Purely visual.
  *
  * Transcript
- * - User messages: no vertical padding, italic, thin theme-colored `▎` bar on the left.
+ * - User messages: no vertical padding, raised band, `❯` prompt arrow with aligned continuations.
  * - Assistant messages: no leading blank line, exactly one blank line between blocks.
- * - Thinking: removed while `hideThinkingBlock` is on; ctrl+t restores the full view.
- * - Tool calls: semantic one-line summaries such as `✓ Searched query ▸`,
- *   `✓ Edited path +5 -1 ▸`, and `✗ $ cmd ▸`; ctrl+o keeps full details reachable.
+ * - Thinking: Pi owns visibility and ctrl+t behavior; visible thinking is recommended.
+ * - Tool calls: operation-first one-line summaries such as `Search query ▸`,
+ *   `Edit path +5 -1 ▸`, and `✗ $ cmd ▸`; ctrl+o keeps full details reachable.
  * - Adjacent command/search/read/edit cards become bounded work summaries. An
  *   invisible marker prevents grouping unrelated transcript text.
  *
@@ -14,7 +14,7 @@
  * - Rounded box; border color tracks thinking level and bash mode.
  * - Box lines keep one column of slack so they never hit the exact terminal
  *   width (Ghostty/iTerm auto-wrap would otherwise collide with the next row).
- * - Top border: live cost/model/context/level metadata drops whole low-priority
+ * - Top border: live model/context/level metadata drops whole low-priority
  *   labels as width tightens, never leaving ambiguous tail fragments.
  * - Bottom border: the single home for animated, semantic work activity and a
  *   middle-elided cwd. Scroll indicators (`↑ N more`) remain intact.
@@ -43,24 +43,21 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import * as PiTui from "@earendil-works/pi-tui";
 
-const { Loader, TUI, TruncatedText, truncateToWidth } = PiTui as any;
+const { Loader, TUI, TuiMainScreen, TuiAltScreen, TruncatedText, truncateToWidth } = PiTui as any;
 const visibleWidthSafe = (PiTui as any).visibleWidth as ((text: string) => number) | undefined;
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 // ── constants ────────────────────────────────────────────────────────────────
 
-const BAR = "▎";
+/** Shared Braille activity spinner (repaints ride the stock loader timer). */
+const ACTIVITY_SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
-/** Bottom-border wave while the agent works (repaints ride the stock loader timer). */
-const BORDER_SPIN = ["~", "≈", "≋", "≈"];
-/** Running-tool card glyph, Amp's rotating therefore-dots. */
-const TOOL_SPIN = ["∴", "∵", "∷", "∵"];
-
-/** Tools whose cards read `Edited/Wrote <path>` and get diff +N -M stats. */
+/** Tools whose cards read `Edit/Write <path>` and get diff +N -M stats. */
 const EDIT_TOOLS = new Set(["edit", "write", "cursor", "apply_patch", "multiedit"]);
 
-/** Collapsed tool-card line, used for grouping. Excludes the running `∴` state. */
-const CARD_RE = /^([✓✗]) (\$ |Read |Searched |Edited |Wrote )/;
+/** Collapsed completed tool-card line, used for grouping. Running rows have a
+ *  Braille spinner and deliberately do not match. */
+const CARD_RE = /^(?:(✗) )?(\$ |Read |Search |Edit |Write )/;
 /** Diff stats at the end of an edit card: `+5 -1 ▸`. */
 const CARD_STATS_RE = /\+(\d+) -(\d+) ▸\s*$/;
 /** Zero-width markers scope final-frame transforms to rows created by this
@@ -92,10 +89,8 @@ let lastCtx: any = null;
 let activeTheme: any = null;
 let thinkingLevel: string | null = null;
 let workPhase: string | null = null;
-let workTokens = 0;
 let activeTools = 0;
 let framePassReady = false;
-let costCache = { entryCount: -1, value: 0 };
 let ctxUsageCache = { at: 0, value: null as any };
 const failedPatches: string[] = [];
 
@@ -135,28 +130,13 @@ const tailCols = (s: string, max: number): string => {
 };
 
 /** Apply a semantic theme role. Plain text is the safe pre-context/NO_COLOR fallback. */
-function semantic(role: "accent" | "success" | "error" | "dim" | "text" | "borderMuted", text: string): string {
+function semantic(role: "accent" | "success" | "error" | "dim" | "text" | "borderMuted" | "toolOutput", text: string): string {
 	try {
 		const fg = activeTheme?.fg;
 		return typeof fg === "function" ? fg.call(activeTheme, role, text) : text;
 	} catch {
 		return text;
 	}
-}
-
-/** Total session cost, summed from persisted assistant usage. */
-function sessionCost(): number | null {
-	const entries = lastCtx?.sessionManager?.getEntries?.();
-	if (!Array.isArray(entries)) return null;
-	if (entries.length === costCache.entryCount) return costCache.value;
-	let cost = 0;
-	for (const e of entries) {
-		const m = e?.message;
-		if (m?.role !== "assistant" || m.stopReason === "error" || m.stopReason === "aborted") continue;
-		cost += m.usage?.cost?.total ?? 0;
-	}
-	costCache = { entryCount: entries.length, value: cost };
-	return cost;
 }
 
 /** Context usage as a percent label, refreshed at most once per second. */
@@ -174,8 +154,7 @@ function contextPercent(): string | null {
 	return pct >= 10 ? `${Math.round(pct)}%` : `${pct.toFixed(1)}%`;
 }
 
-/** cwd with $HOME shortened to `~`, middle segments elided to fit `max` columns
- *  (Amp-style: `~/Library/…/PhD/00_thesis`). */
+/** cwd with $HOME shortened to `~`, middle segments elided to fit `max` columns. */
 function displayPath(max: number): string {
 	if (max <= 0) return "";
 	const home = process.env.HOME;
@@ -232,16 +211,16 @@ function toolSummary(name: string, args: any): string {
 	if (cat === "cmd" && typeof args?.command === "string") return `$ ${oneLine(args.command.split(/\r?\n/)[0])}`;
 	if (cat === "search") {
 		const query = firstText(args, ["query", "pattern", "search", "term", "glob"]) || path;
-		return query ? `Searched ${query}` : "Searched";
+		return query ? `Search ${query}` : "Search";
 	}
 	if (cat === "read" && path) return `Read ${path}`;
-	if (cat === "edit" && path) return `${name.toLowerCase() === "write" ? "Wrote" : "Edited"} ${path}`;
+	if (cat === "edit" && path) return `${name.toLowerCase() === "write" ? "Write" : "Edit"} ${path}`;
 	if (path) return `${name} ${path}`;
 	const description = firstText(args, ["description"]);
 	return description ? `${name} ${description.split("\n")[0]}` : name.replace(/[_-]+/g, " ");
 }
 
-function cardInfo(line: string | undefined): { icon: string; cat: CardCat; add: number; del: number } | null {
+function cardInfo(line: string | undefined): { failed: boolean; cat: CardCat; add: number; del: number } | null {
 	if (!line?.includes(CARD_MARK)) return null;
 	const plain = stripAnsi(line);
 	const m = plain.match(CARD_RE);
@@ -251,16 +230,16 @@ function cardInfo(line: string | undefined): { icon: string; cat: CardCat; add: 
 		? "cmd"
 		: prefix.startsWith("Read")
 			? "read"
-			: prefix.startsWith("Searched")
+			: prefix.startsWith("Search")
 				? "search"
 				: "edit";
 	const s = cat === "edit" ? plain.match(CARD_STATS_RE) : null;
-	return { icon: m[1], cat, add: s ? Number(s[1]) : 0, del: s ? Number(s[2]) : 0 };
+	return { failed: m[1] === "✗", cat, add: s ? Number(s[1]) : 0, del: s ? Number(s[2]) : 0 };
 }
 
 /** Merge runs of adjacent same-category cards (separated only by blank lines):
- *  `✓ Ran N commands[, M failed] ▸`, `✓ Read N files ▸`,
- *  `✓ Edited N files +ΣA -ΣD ▸` (diff stats aggregated, Amp-style). */
+ *  `◈ Ran N commands[, M failed] ▸`, `◈ Read N files ▸`,
+ *  `◈ Edited N files +ΣA -ΣD ▸` (diff stats aggregated). */
 function mergeToolCards(lines: string[], width: number): string[] {
 	if (width < 16) return lines;
 	const out: string[] = [];
@@ -281,12 +260,12 @@ function mergeToolCards(lines: string[], width: number): string[] {
 			run.push(next);
 		}
 		if (run.length > 1) {
-			const failed = run.filter((c) => c.icon === "✗").length;
+			const failed = run.filter((c) => c.failed).length;
 			const noun =
 				cur.cat === "cmd"
 					? `Ran ${run.length} commands`
 					: cur.cat === "search"
-						? `Ran ${run.length} searches`
+						? `Searched ${run.length} patterns`
 						: cur.cat === "read"
 							? `Read ${run.length} files`
 							: `Edited ${run.length} files`;
@@ -300,14 +279,14 @@ function mergeToolCards(lines: string[], width: number): string[] {
 				cur.cat === "cmd" ? `Cmd ${run.length}` : cur.cat === "search" ? `Search ${run.length}` : cur.cat === "read" ? `Read ${run.length}` : `Edit ${run.length}`;
 			const categoryMark = cur.cat === "cmd" ? "C" : cur.cat === "search" ? "S" : cur.cat === "read" ? "R" : "E";
 			const candidates = [
-				{ noun, fail: failed ? `, ${failed} failed` : "", stats: statsPlain },
-				{ noun, fail: failed ? `, ${failed} failed` : "", stats: "" },
-				{ noun: compactNoun, fail: failed ? `, ${failed} failed` : "", stats: "" },
+				{ noun, fail: failed ? ` · ${failed} failed` : "", stats: statsPlain },
+				{ noun, fail: failed ? ` · ${failed} failed` : "", stats: "" },
+				{ noun: compactNoun, fail: failed ? ` · ${failed} failed` : "", stats: "" },
 				{ noun: compactNoun, fail: failed ? ` · ${failed} fail` : "", stats: "" },
 				{ noun: `${categoryMark}${run.length}`, fail: failed ? ` F${failed}` : "", stats: "" },
 			];
 			const fits = (part: { noun: string; fail: string; stats: string }) =>
-				colWidth(`✗ ${part.noun}${part.fail}${part.stats} ▸`) <= Math.max(1, width - 1);
+				colWidth(`◈ ${part.noun}${part.fail}${part.stats} ▸`) <= Math.max(1, width - 1);
 			const chosen = candidates.find(fits);
 			// If even the count-preserving shorthand cannot fit, retain the
 			// already bounded individual cards instead of dropping semantics.
@@ -316,12 +295,12 @@ function mergeToolCards(lines: string[], width: number): string[] {
 				i++;
 				continue;
 			}
-			const icon = semantic(failed ? "error" : "success", failed ? "✗" : "✓");
+			const icon = semantic("dim", "◈");
 			const fail = chosen.fail ? semantic("error", chosen.fail) : "";
 			const stats = chosen.stats
 				? ` ${semantic("success", chosen.stats.trim().split(" ")[0])} ${semantic("error", chosen.stats.trim().split(" ")[1])}`
 				: "";
-			out.push(`${icon} ${chosen.noun}${fail}${stats} ${semantic("dim", "▸")}${CARD_MARK}`);
+			out.push(`${icon} ${semantic("toolOutput", chosen.noun)}${fail}${stats} ${semantic("dim", "▸")}${CARD_MARK}`);
 			i = j + 1;
 		} else {
 			out.push(lines[i]);
@@ -441,8 +420,7 @@ function wireEvents(pi: ExtensionAPI) {
 	const activeToolNames = new Map<string, string>();
 	on("agent_start", (e, ctx) => {
 		track(e, ctx);
-		workPhase = "Working";
-		workTokens = 0;
+		workPhase = "Thinking…";
 		activeTools = 0;
 		activeToolNames.clear();
 	});
@@ -451,35 +429,27 @@ function wireEvents(pi: ExtensionAPI) {
 		const content = event?.message?.content;
 		if (!Array.isArray(content)) return;
 		const last = content[content.length - 1];
-		workPhase = last?.type === "thinking" ? "Thinking" : last?.type === "toolCall" ? "Tool call" : "Streaming";
-		const usageOut = event?.message?.usage?.output;
-		if (usageOut > 0) {
-			workTokens = usageOut;
-		} else {
-			let chars = 0;
-			for (const c of content) chars += (c?.text?.length ?? 0) + (c?.thinking?.length ?? 0);
-			workTokens = Math.round(chars / 4);
-		}
+		workPhase = last?.type === "thinking" ? "Thinking…" : last?.type === "toolCall" ? "Working…" : "Responding…";
 	});
 
 	// Detailed tool activity has one stable home in the editor's bottom border:
-	// `≈ Exploring 1 search`, `≈ Running 2 commands`, `≈ Editing 1 file`...
+	// `⠋ Searching 1 pattern…`, `⠋ Running 2 commands…`, `⠋ Editing 1 file…`.
 	const activityPhrase = (names: string[]): string => {
 		const n = names.length;
 		const cats = new Set(names.map(toolCategory));
-		if (cats.size > 1) return `Running ${n} tools`;
+		if (cats.size > 1) return `Running ${n} tools…`;
 		const plural = (word: string) => (n > 1 ? `${n} ${word}s` : `1 ${word}`);
 		switch ([...cats][0]) {
 			case "cmd":
-				return `Running ${plural("command")}`;
+				return `Running ${plural("command")}…`;
 			case "search":
-				return `Exploring ${plural("search")}`;
+				return `Searching ${plural("pattern")}…`;
 			case "read":
-				return `Reading ${plural("file")}`;
+				return `Reading ${plural("file")}…`;
 			case "edit":
-				return `Editing ${plural("file")}`;
+				return `Editing ${plural("file")}…`;
 			default:
-				return n === 1 ? "Running 1 tool" : `Running ${n} tools`;
+				return n === 1 ? "Running 1 tool…" : `Running ${n} tools…`;
 		}
 	};
 	on("tool_execution_start", (event, _ctx) => {
@@ -496,20 +466,18 @@ function wireEvents(pi: ExtensionAPI) {
 			if (first !== undefined) activeToolNames.delete(first);
 		}
 		activeTools = activeToolNames.size;
-		workPhase = activeTools === 0 ? "Working" : activityPhrase([...activeToolNames.values()]);
+		workPhase = activeTools === 0 ? "Thinking…" : activityPhrase([...activeToolNames.values()]);
 	});
 	on("agent_end", (e, ctx) => {
 		track(e, ctx);
 		workPhase = null;
-		workTokens = 0;
 		activeTools = 0;
 		activeToolNames.clear();
-		costCache.entryCount = -1;
 		ctxUsageCache.at = 0;
 	});
 }
 
-/** User messages: compact, italic, thin theme-colored left bar. */
+/** User messages: compact raised prompt band with a Grok-style arrow. */
 function patchUserMessages() {
 	const proto = UserMessageComponent?.prototype as any;
 	if (!proto) return guard("userMessages", false);
@@ -525,14 +493,14 @@ function patchUserMessages() {
 	if (typeof origRebuild === "function") {
 		proto.rebuild = function () {
 			origRebuild.call(this);
-			const box = this.children?.[0];
+			const box = this.contentBox ?? this.children?.[0];
 			if (box && typeof box.paddingY === "number") {
 				box.paddingY = 0;
 				box.invalidateCache?.();
 			}
 			const md = box?.children?.[0];
 			if (md?.defaultTextStyle) {
-				md.defaultTextStyle.italic = true;
+				md.defaultTextStyle.italic = false;
 				md.invalidate?.();
 			}
 		};
@@ -540,19 +508,32 @@ function patchUserMessages() {
 
 	if (typeof origRender === "function") {
 		proto.render = function (width: number) {
-			if (width < 3) return origRender.call(this, width);
-			// 3 cols narrower: 2 for the bar prefix + 1 slack so lines never hit
-			// the exact terminal width (avoids hard-wrap artifacts).
-			const lines = origRender.call(this, width - 3);
-			const colorFn = this.children?.[0]?.children?.[0]?.defaultTextStyle?.color;
-			const bar = (typeof colorFn === "function" ? colorFn(BAR) : BAR) + " ";
-			return lines.map((line: string) => afterLeadingOsc(line, bar));
+			if (width < 4) return origRender.call(this, width);
+			const box = this.contentBox ?? this.children?.[0];
+			if (box && typeof box.paddingY === "number" && box.paddingY !== 0) {
+				box.paddingY = 0;
+				box.invalidateCache?.();
+			}
+			const md = box?.children?.[0];
+			if (md?.defaultTextStyle && md.defaultTextStyle.italic !== false) {
+				md.defaultTextStyle.italic = false;
+				md.invalidate?.();
+			}
+			// The box keeps its one-column left padding. Prefix one external
+			// column and reserve one right-side slack column to avoid hard wraps.
+			const lines = origRender.call(this, width - 2);
+			const colorFn = md?.defaultTextStyle?.color;
+			const bgFn = box?.bgFn;
+			const paint = (text: string) => (typeof bgFn === "function" ? bgFn(text) : text);
+			const arrow = paint(typeof colorFn === "function" ? colorFn("❯") : "❯");
+			const indent = paint(" ");
+			return lines.map((line: string, index: number) => afterLeadingOsc(line, index === 0 ? arrow : indent));
 		};
 	}
 }
 
-/** Assistant messages: no leading blank line; thinking blocks dropped while
- *  hidden (ctrl+t restores them — the unfiltered message is kept). */
+/** Assistant messages: no leading blank line. Pi remains the source of truth
+ *  for streaming arguments and reversible thinking visibility. */
 function patchAssistantMessages() {
 	const proto = AssistantMessageComponent?.prototype as any;
 	if (!proto) return guard("assistantMessages", false);
@@ -561,13 +542,8 @@ function patchAssistantMessages() {
 
 	const origUpdate = proto.updateContent;
 	if (typeof origUpdate !== "function") return guard("assistantMessages", false);
-	proto.updateContent = function (message: any) {
-		let m = message;
-		if (this.hideThinkingBlock && Array.isArray(m?.content) && m.content.some((c: any) => c?.type === "thinking")) {
-			m = { ...m, content: m.content.filter((c: any) => c?.type !== "thinking") };
-		}
-		origUpdate.call(this, m);
-		this.lastMessage = message;
+	proto.updateContent = function (message: any, ...rest: any[]) {
+		origUpdate.call(this, message, ...rest);
 		const cc = this.contentContainer;
 		const first = cc?.children?.[0];
 		if (first?.constructor?.name === "Spacer") {
@@ -576,7 +552,7 @@ function patchAssistantMessages() {
 	};
 }
 
-/** Tool calls: Amp-style one-line cards when collapsed; ctrl+o expands. */
+/** Tool calls: Grok-inspired operation-first cards when collapsed; ctrl+o expands. */
 function patchToolCards() {
 	const proto = ToolExecutionComponent?.prototype as any;
 	if (!proto) return guard("toolCards", false);
@@ -615,18 +591,20 @@ function patchToolCards() {
 		}
 
 		const err = this.result?.isError === true;
-		const spinFrame = TOOL_SPIN[Math.floor(Date.now() / 280) % TOOL_SPIN.length];
-		const iconPlain = this.isPartial ? spinFrame : err ? "✗" : "✓";
-		const icon = semantic(this.isPartial ? "accent" : err ? "error" : "success", iconPlain);
+		const spinFrame = ACTIVITY_SPIN[Math.floor(Date.now() / 135) % ACTIVITY_SPIN.length];
+		const iconPlain = this.isPartial ? spinFrame : err ? "✗" : "";
+		const icon = iconPlain ? semantic(this.isPartial ? "accent" : "error", iconPlain) : "";
+		const prefix = icon ? `${icon} ` : "";
 		// Impact statistics yield before the primary action or target is shortened.
-		if (statsPlain && colWidth(text) + colWidth(statsPlain) + 4 > width - 1) {
+		const chromeWidth = 2 + colWidth(iconPlain) + (iconPlain ? 1 : 0);
+		if (statsPlain && colWidth(text) + colWidth(statsPlain) + chromeWidth > width - 1) {
 			stats = "";
 			statsPlain = "";
 		}
-		const budget = Math.max(1, width - 5 - colWidth(statsPlain));
+		const budget = Math.max(1, width - 3 - colWidth(iconPlain) - (iconPlain ? 1 : 0) - colWidth(statsPlain));
 		const shownText = colWidth(text) > budget ? truncCols(text, budget) : text;
 		const marker = framePassReady ? CARD_MARK : "";
-		return ["", `${icon} ${shownText}${stats} ${semantic("dim", "▸")}${marker}`];
+		return ["", `${prefix}${semantic("toolOutput", shownText)}${stats} ${semantic("dim", "▸")}${marker}`];
 	};
 }
 
@@ -692,23 +670,67 @@ function pinComposer(lines: string[], terminalRows: number): string[] {
 /** Final TUI pass: merge adjacent tool cards, anchor the optional composer,
  *  and frame queued steering. */
 function patchCardGrouping() {
-	const proto = TUI?.prototype as any;
-	if (!proto) return guard("cardGrouping", false);
-	if (proto.__ampStyleFrame2) {
-		framePassReady = true;
-		return;
+	const modeProto = InteractiveMode?.prototype as any;
+	if (TuiAltScreen && modeProto && !modeProto.__ampStyleFullscreenFrame) {
+		const origMount = modeProto.mountInteractiveTui;
+		if (typeof origMount === "function") {
+			modeProto.__ampStyleFullscreenFrame = true;
+			modeProto.mountInteractiveTui = function (tui: any, components: any[]) {
+				const owner = this;
+				const document = this.documentContainer;
+				if (document && !document.__ampStyleFrame) {
+					const origDocumentRender = document.render;
+					if (typeof origDocumentRender === "function") {
+						document.__ampStyleFrame = true;
+						document.render = function (width: number) {
+							return mergeToolCards(origDocumentRender.call(this, width), width).map((line) =>
+								FRAME_MARKS.reduce((text, marker) => text.replaceAll(marker, ""), line),
+							);
+						};
+					}
+				}
+				const pending = this.pendingMessagesContainer;
+				if (pending && !pending.__ampStyleFrame) {
+					const origPendingRender = pending.render;
+					if (typeof origPendingRender === "function") {
+						pending.__ampStyleFrame = true;
+						pending.render = function (width: number) {
+							const lines = origPendingRender.call(this, width);
+							return owner.renderer?.mode === "fullscreen" ? decoratePendingSteer(lines, width) : lines;
+						};
+					}
+				}
+				return origMount.call(this, tui, components);
+			};
+		} else {
+			guard("fullscreenFrame", false);
+		}
 	}
 
-	const origRender = proto.render;
-	if (typeof origRender !== "function") return guard("cardGrouping", false);
-	proto.__ampStyle = true;
-	proto.__ampStyleFrame2 = true;
-	proto.render = function (width: number) {
-		const merged = mergeToolCards(origRender.call(this, width), width);
-		const anchored = pinComposer(merged, Number(this.terminal?.rows ?? 0));
-		return decoratePendingSteer(anchored, width);
-	};
-	framePassReady = true;
+	// Pi <=0.74 exported one TUI class. Current Pi exports separate main- and
+	// alternate-screen implementations. Fullscreen already bottom-aligns its
+	// dock; only main-screen renderers need the final pin/queue pass.
+	const constructors = [...new Set([TUI, TuiMainScreen].filter((ctor) => typeof ctor === "function"))];
+	let patched = false;
+	for (const ctor of constructors) {
+		const proto = ctor.prototype as any;
+		if (proto.__ampStyleFrame2) {
+			patched = true;
+			continue;
+		}
+		const origRender = proto.render;
+		if (typeof origRender !== "function") continue;
+		proto.__ampStyle = true;
+		proto.__ampStyleFrame2 = true;
+		proto.render = function (width: number) {
+			const merged = mergeToolCards(origRender.call(this, width), width);
+			const anchored = pinComposer(merged, Number(this.terminal?.rows ?? 0));
+			return decoratePendingSteer(anchored, width);
+		};
+		patched = true;
+	}
+	guard("cardGrouping", patched);
+	framePassReady = patched;
 }
 
 /** Status keys hidden from the footer. `cursor` (pi-cursor-sdk's
@@ -786,7 +808,7 @@ function patchChrome() {
 	}
 }
 
-/** Editor: Amp-style rounded box with live info in the borders. */
+/** Editor: rounded Pi adaptation with Grok-like live activity in the border. */
 function patchEditor() {
 	const proto = CustomEditor?.prototype as any;
 	if (!proto) return guard("editor", false);
@@ -855,8 +877,6 @@ function patchEditor() {
 
 		// Top border: whole labels disappear by priority instead of tail-truncating
 		// into ambiguous model or metric fragments at narrow widths.
-		const cost = sessionCost();
-		const costLabel = cost === null ? "" : `$${cost >= 0.1 ? cost.toFixed(2) : cost.toFixed(3)}`;
 		const model = lastCtx?.getModel?.() ?? lastCtx?.model;
 		const modelName = String(model?.name ?? model?.id ?? "");
 		const modelId = String(model?.id ?? modelName)
@@ -868,8 +888,7 @@ function patchEditor() {
 		const availableTop = Math.max(0, boxWidth - 6 - (scrollInfo(lines[0]) ? colWidth(scrollInfo(lines[0])) + 3 : 0));
 		const join = (values: string[], separator: string) => values.filter(Boolean).join(separator);
 		const topCandidates = [
-			join([costLabel, modelName, pct, level], " ─ "),
-			join([costLabel, modelName, pct, level], " · "),
+			join([modelName, pct, level], " ─ "),
 			join([modelName, pct, level], " · "),
 			join([modelName, level], " · "),
 			join([modelId, level], " · "),
@@ -880,12 +899,8 @@ function patchEditor() {
 
 		// Bottom border: current activity owns the left; cwd uses only the
 		// remaining right-side budget and keeps meaningful path endpoints.
-		let status = workPhase ?? "";
-		if (status && workTokens > 0 && boxWidth >= 48) {
-			const tok = workTokens >= 1000 ? `${(workTokens / 1000).toFixed(1)}k` : `${workTokens}`;
-			status = `${status} ${tok} tok`;
-		}
-		const frame = BORDER_SPIN[Math.floor(Date.now() / 250) % BORDER_SPIN.length];
+		const status = workPhase ?? "";
+		const frame = ACTIVITY_SPIN[Math.floor(Date.now() / 135) % ACTIVITY_SPIN.length];
 		const activity = status ? `${frame} ${status}` : "";
 		const leftWidth = activity ? colWidth(activity) + 3 : 0;
 		const pathBudget = Math.min(Math.floor(boxWidth / 2), Math.max(0, boxWidth - 6 - leftWidth));

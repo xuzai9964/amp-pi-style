@@ -1,7 +1,7 @@
 {
   "name": "amp-pi-style",
-  "version": "0.4.0",
-  "description": "Amp-inspired look for the pi coding agent: flat theme, compact spacing, italic user messages with an accent bar",
+  "version": "0.5.0",
+  "description": "Grok-informed visual styling for the pi coding agent with compact transcript, tools, and live state",
   "type": "module",
   "keywords": [
     "pi-package"

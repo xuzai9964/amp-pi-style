@@ -1,20 +1,21 @@
-# Amp CLI 设计语言
+# Grok-informed Agent TUI 设计语言
 
-> **一句话定义：** Amp 把终端设计成一份会实时更新的工程工作记录：默认平静，执行过程可感知，细节按需展开，重要状态永远靠近注意力中心。
+> **一句话定义：** 把终端设计成一份会实时更新的工程工作记录：默认平静，执行过程可感知，细节按需展开，重要状态永远靠近注意力中心。
 
-本文不是 Amp 官方发布的 Design System，而是根据 Amp 官方文档、产品演示和本仓库的实现反向蒸馏出的设计模型。Amp CLI 仍在高速演化，具体颜色、符号和组件可能随版本变化；本文关注的是更稳定、可迁移的设计原则。
+本文不是 xAI 或 Amp 官方发布的 Design System，而是根据 Grok Build 开源实现、Amp 文档和本仓库实现蒸馏出的设计模型。具体颜色、符号和组件可能随上游变化；本文关注的是更稳定、可迁移的设计原则。
 
 ## 证据边界
 
 文中的结论分为四类：
 
-- **官方事实**：Amp 文档或演示直接确认的行为。
+- **上游事实**：Grok Build 源码或 Amp 文档直接确认的行为。
 - **视觉观察**：官方界面录像中反复出现的模式。
 - **设计推断**：多个行为共同指向的原则。
-- **复用规范**：适合用于其他 CLI 的建议，不代表 Amp 官方标准。
+- **复用规范**：适合用于其他 CLI 的建议，不代表 xAI 或 Amp 官方标准。
 
 主要来源：
 
+- [xai-org/grok-build](https://github.com/xai-org/grok-build)
 - [Amp Owner's Manual](https://ampcode.com/manual)
 - [Look Ma, No Flicker](https://ampcode.com/news/look-ma-no-flicker)
 - [Command Palette, Not Slash Commands](https://ampcode.com/news/command-palette)
@@ -25,9 +26,9 @@
 
 ---
 
-## 一、Amp 真正设计的是注意力
+## 一、Agent TUI 真正设计的是注意力
 
-Amp 的深色背景、强调色、`∴`、`✓`、`✗`、`▸` 和紧凑工具卡片只是表层。它真正设计的是用户在一次长时间 Agent 运行中的注意力分配：
+Grok Build 的深色背景、`❯`、Braille spinner、`◈`、`✗`、`▸` 和紧凑工具行只是表层。真正需要设计的是用户在一次长时间 Agent 运行中的注意力分配：
 
 ```text
 第一层：现在发生了什么？
@@ -37,13 +38,13 @@ Thinking / Running / Editing / Failed
 command / path / file count / diff stats
 
 第三层：结果是否值得查看？
-✓ success / ✗ failure / +N -M
+completed / ✗ failure / +N -M
 
 第四层：具体发生了什么？
 展开后才显示日志、推理、diff 和完整输出
 ```
 
-用户通常只需要前三层。第四层存在，但不应持续占据屏幕。因此，Amp 的核心不是单纯的 minimalism，而是：
+用户通常只需要前三层。第四层存在，但不应持续占据屏幕。因此，核心不是单纯的 minimalism，而是：
 
 > 以最低视觉成本，维持用户对系统状态的正确理解。
 
@@ -89,8 +90,8 @@ Amp 不把对话渲染成聊天软件里左右对齐的气泡，而更接近工�
 最嘈杂的信息——工具调用、推理、命令输出和 diff——应默认折叠为摘要：
 
 ```text
-✓ Read src/config.ts ▸
-✓ Edited src/config.ts +5 -1 ▸
+Read src/config.ts ▸
+Edit src/config.ts +5 -1 ▸
 ✗ $ npm test ▸
 ```
 
@@ -109,17 +110,17 @@ Amp 不把对话渲染成聊天软件里左右对齐的气泡，而更接近工�
 Agent 一次任务可能连续读取或编辑许多文件。逐条保留会让用户失去整体感，同类连续动作应提升为工作摘要：
 
 ```text
-✓ Read 8 files ▸
-✓ Ran 5 commands ▸
-✗ Ran 15 commands, 2 failed ▸
-✓ Edited 4 files +83 -17 ▸
+◈ Read 8 files ▸
+◈ Ran 5 commands ▸
+◈ Ran 15 commands · 2 failed ▸
+◈ Edited 4 files +83 -17 ▸
 ```
 
 语义压缩不是简单地“少显示”，而是把事件序列提升为工作摘要。
 
 ```text
-不够好：✓ Done
-更好：  ✓ Read 4 files ▸
+不够好：Done
+更好：  ◈ Read 4 files ▸
 ```
 
 摘要不能丢失动作类型、对象规模和失败数量。
@@ -158,11 +159,10 @@ Amp 官方把 no flicker 单独作为 TUI 的产品里程碑。对实时 Agent �
 
 ### 7. Motion Means Activity：动画只表达系统仍然活着
 
-Amp 风格中的动画很小：
+Grok 风格中的活动动画很小且等宽：
 
 ```text
-∴ → ∵ → ∷ → ∵
-~ → ≈ → ≋ → ≈
+⠋ → ⠙ → ⠹ → ⠸ → ⠼ → ⠴ → ⠦ → ⠧
 ```
 
 它们没有面积变化，也不会重排布局，只表示 Agent 仍在思考、工具仍在运行或请求没有卡死。
@@ -171,7 +171,7 @@ Amp 风格中的动画很小：
 
 - 动画字符尽量等宽。
 - 一种动画只代表一种状态类别。
-- 成功后收敛为 `✓`，失败后收敛为 `✗`。
+- 完成后移除 spinner，失败后收敛为 `✗`。
 - 不要让多个 spinner 同时竞争注意力。
 - 动画频率应可感知，但不能成为视觉噪声。
 - 声音只用于任务完成或需要用户输入等关键时刻。
@@ -280,10 +280,10 @@ error           仅异常时
 例如用户消息可以呈现为：
 
 ```text
-▎ 帮我修复认证状态竞争问题
+❯ 帮我修复认证状态竞争问题
 ```
 
-`▎` 建立身份，accent 建立注意力，italic 区分人类输入和机器输出，不再需要气泡、头像或 `YOU` 标签。
+`❯` 建立输入身份，raised band 建立任务边界，不再需要气泡、头像或 `YOU` 标签；换行继续与正文起始列对齐。
 
 ### 4. 空间：紧凑不等于拥挤
 
@@ -309,14 +309,13 @@ Agent 正文
 
 | 符号 | 语义 |
 |---|---|
-| `▎` | 用户输入或引用边界 |
-| `∴` / `∵` / `∷` | 正在思考或执行 |
-| `✓` | 成功完成 |
+| `❯` | 用户输入 |
+| `⠋` / `⠙` / `⠹` | 正在思考或执行 |
+| `◈` | 已聚合的一组工作 |
 | `✗` | 失败 |
 | `▸` | 可展开详情 |
 | `+N` | 新增 |
 | `-N` | 删除 |
-| `≈` | 持续工作 |
 | `…` | 截断或省略路径 |
 | `↑ N more` | 上方还有内容 |
 | `↓ N more` | 下方还有内容 |
@@ -330,15 +329,14 @@ Agent 正文
 ### 1. User Prompt Echo
 
 ```text
-▎ 检查一下这个模块为什么会死锁
+❯ 检查一下这个模块为什么会死锁
 ```
 
 职责：建立任务边界。
 
-- 使用一条细 accent bar；
-- 正文可使用 italic；
-- 不使用大面积背景；
-- 自动换行时每行保持 bar；
+- 使用 `❯` prompt arrow 和一条低对比 raised band；
+- 正文使用常规字形；
+- 自动换行时使用两列对齐缩进；
 - 与 assistant output 保留一个空行。
 
 ### 2. Assistant Prose
@@ -359,10 +357,10 @@ Agent 正文
 ### 3. Activity Line
 
 ```text
-∴ Exploring 2 searches
-∴ Running 3 commands
-∴ Reading 1 file
-∴ Editing 2 files
+⠋ Searching 2 patterns…
+⠋ Running 3 commands…
+⠋ Reading 1 file…
+⠋ Editing 2 files…
 ```
 
 职责：回答“现在正在做什么”。Activity 文案应使用“动词 + 对象 + 数量”，而不是泄漏内部工具名。
@@ -375,15 +373,15 @@ Agent 正文
 ### 4. Tool Summary Card
 
 ```text
-✓ Read src/auth.ts ▸
-✓ Edited src/auth.ts +12 -4 ▸
+Read src/auth.ts ▸
+Edit src/auth.ts +12 -4 ▸
 ✗ $ npm test ▸
 ```
 
 职责：压缩执行历史。
 
 ```text
-Pending → Running → Success ✓
+Pending → Running → Completed
                   └→ Failed  ✗
 
 Success / Failed → Expanded details
@@ -396,9 +394,9 @@ Success / Failed → Expanded details
 Composer 是用户注意力的重置点，可以把边框空间同时用作低响度状态带：
 
 ```text
-╭──────────────────── $0.03 ─ model ─ 18% ─ high ─╮
+╭────────────────────────── model ─ 18% ─ high ─╮
 │ 下一条指令……                                     │
-╰─ ≈ Thinking 1.2k tok ─────────────── ~/repo/app ─╯
+╰─ ⠋ Thinking… ─────────────────── ~/repo/app ─╯
 ```
 
 关键规则：
@@ -601,10 +599,10 @@ type UIEvent =
 
 ```text
 read    → Read <path>
-edit    → Edited <path> +N -M
-write   → Wrote <path> +N -M
+edit    → Edit <path> +N -M
+write   → Write <path> +N -M
 bash    → $ <first command line>
-search  → Searched <query>
+search  → Search <query>
 other   → <tool> <short description>
 ```
 
