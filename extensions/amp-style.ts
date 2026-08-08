@@ -2,7 +2,7 @@
  * amp-pi-style — Grok-informed look & feel for the pi coding agent. Purely visual.
  *
  * Transcript
- * - User messages: canvas-flat prompt rows with vertical breathing room and a
+ * - User messages: terminal-inheriting prompt rows with vertical breathing room and a
  *   `❯` prompt arrow whose continuations stay aligned.
  * - Assistant messages: no leading blank line; thinking gains Grok's subdued
  *   `◆` header and `┃` rail while Pi keeps ctrl+t visibility behavior.
@@ -13,7 +13,8 @@
  *
  * Live region
  * - Pi's official above-editor widget becomes Grok's dedicated turn-status row;
- *   it owns the only activity spinner and leaves a stable prompt gap.
+ *   it owns the only activity indicator (animated Braille thinking-orbs;
+ *   `AMP_PI_ORBS=off` restores the legacy spinner) and leaves a stable prompt gap.
  * - Pi's official footer becomes a separate agent-status row: cwd/git at left,
  *   context and extension state at right. It never shares the prompt border.
  * - The rounded prompt uses quiet active/idle borders, a `❯` input prefix, and
@@ -26,15 +27,12 @@
  *  - The stock working indicator is disabled through Pi's official API. The
  *   turn-status widget owns its repaint timer; retry/compaction rows stay stock.
  *
- * Canvas
- * - In fullscreen (alternate-screen) mode the extension paints every rewritten
- *   cell onto one opaque background, including padding after ANSI resets, so the
- *   Grok canvas stays continuous across transcript, prompt, and footer even in
- *   translucent terminals. Selection, overlays, and semantic diff states remain
- *   the only elevated surfaces. The color comes from the active theme's
- *   `vars.canvas` via `CANVAS_BY_THEME`, is overridable with `AMP_PI_CANVAS`,
- *   and `AMP_PI_CANVAS=0` restores terminal inheritance. Inline mode always
- *   inherits the terminal so scrollback is never flooded with colored blocks.
+ * Surface
+ * - Fullscreen and inline modes inherit the terminal background; the extension
+ *   never paints an opaque screen-sized canvas.
+ * - The composer, including its borders and input rows, also inherits the
+ *   terminal background. Only Pi-owned semantic surfaces such as selection,
+ *   overlays, and diffs may apply a background.
  *
  * Implementation: official APIs where available, guarded prototype patches for
  * the remaining surfaces. Event contexts are reduced to plain render snapshots
@@ -52,6 +50,7 @@ import {
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import * as PiTui from "@earendil-works/pi-tui";
+import { liveStatusLayout, orbColumns, orbMode, phaseToOrbState, renderOrbGlyph } from "./orbs/render";
 
 const { HStack, TUI, TuiMainScreen, TuiAltScreen, TruncatedText, truncateToWidth } = PiTui as any;
 const visibleWidthSafe = (PiTui as any).visibleWidth as ((text: string) => number) | undefined;
@@ -63,8 +62,14 @@ const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme
  *  transcript and dock surface keeps the same baseline and wrap width. */
 const SCREEN_GUTTER = 2;
 
-/** Braille activity spinner owned by the turn-status widget. */
+/** Legacy Braille spinner when `AMP_PI_ORBS=off`. */
 const ACTIVITY_SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+/** Soft accent tint for Braille orbs (matches theme `vars.accent`). */
+const ORB_ACCENT_BY_THEME: Record<string, [number, number, number]> = {
+	"amp-style": [0xbb, 0x9a, 0xf7],
+	"amp-warm": [0xe7, 0x89, 0x4c],
+};
 
 /** Tools whose cards read `Edit/Write <path>` and get diff +N -M stats. */
 const EDIT_TOOLS = new Set(["edit", "write", "cursor", "apply_patch", "multiedit"]);
@@ -93,20 +98,6 @@ const PIN_COMPOSER_ENV = process.env.AMP_PI_PIN_COMPOSER?.trim();
 const PIN_COMPOSER = PIN_COMPOSER_ENV
 	? /^(?:1|true|yes|on)$/i.test(PIN_COMPOSER_ENV)
 	: process.platform === "darwin";
-
-/** Opaque fullscreen canvas per shipped theme. Must mirror each theme's
- *  `vars.canvas` / `export.pageBg`; `AMP_PI_CANVAS` overrides, `0`/`off`
- *  disables (inherit the terminal). Unknown themes inherit the terminal. */
-const CANVAS_BY_THEME: Record<string, string> = {
-	"amp-style": "#141414",
-	"amp-warm": "#0f0f0f",
-};
-const CANVAS_ENV = process.env.AMP_PI_CANVAS?.trim();
-const CANVAS_ROW_RE = /\x1b\[(\d+);1H\x1b\[2K/g;
-const CANVAS_IMAGE_RE = /\x1b_G|\x1b]1337;/;
-/** First frame suffix that must remain outside row paint. Covers absolute
- *  hardware-cursor placement, cursor visibility, and synchronized-output end. */
-const CANVAS_SUFFIX_RE = /\x1b\[(?:\d+;\d+H|\?25[hl]|\?2026l)/;
 
 /** Leading OSC sequences (e.g. OSC 133 semantic-prompt marks) that must stay at
  *  the very start of a line — semantic-prompt terminals (Ghostty, iTerm2) break
@@ -168,6 +159,7 @@ function colWidth(s: string): number {
 /** Truncate to `max` columns, with or without a visible omission mark. */
 const truncCols = (s: string, max: number): string => truncateToWidth(s, Math.max(0, max), "…");
 const hardTrim = (s: string, max: number): string => truncateToWidth(s, Math.max(0, max), "");
+
 const tailCols = (s: string, max: number): string => {
 	let out = "";
 	let width = 0;
@@ -251,96 +243,6 @@ function statusLine(left: string, rightItems: string[], width: number): string {
 		items.shift();
 	}
 	return hardTrim(left, width);
-}
-
-/** Background ANSI prefix for a `#RRGGBB` color, or null when invalid.
- *  Match Pi's active truecolor/256-color mode so the canvas survives SSH and
- *  older terminals instead of forcing a `48;2` sequence they may ignore. */
-function hexToBgAnsi(hex: string, mode = "truecolor"): string | null {
-	const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
-	if (!m) return null;
-	const n = parseInt(m[1], 16);
-	const r = (n >> 16) & 255;
-	const g = (n >> 8) & 255;
-	const b = n & 255;
-	if (mode === "truecolor") return `\x1b[48;2;${r};${g};${b}m`;
-
-	const cube = [0, 95, 135, 175, 215, 255];
-	const nearest = (value: number, values: number[]) =>
-		values.reduce((best, candidate, index) =>
-			Math.abs(candidate - value) < Math.abs(values[best] - value) ? index : best, 0);
-	const ri = nearest(r, cube);
-	const gi = nearest(g, cube);
-	const bi = nearest(b, cube);
-	const cubeIndex = 16 + 36 * ri + 6 * gi + bi;
-	const distance = (ar: number, ag: number, ab: number, br: number, bg: number, bb: number) =>
-		(ar - br) ** 2 * 0.299 + (ag - bg) ** 2 * 0.587 + (ab - bb) ** 2 * 0.114;
-	const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
-	const grayValues = Array.from({ length: 24 }, (_, i) => 8 + i * 10);
-	const graySlot = nearest(gray, grayValues);
-	const grayIndex = 232 + graySlot;
-	const index = Math.max(r, g, b) - Math.min(r, g, b) < 10 &&
-		distance(r, g, b, grayValues[graySlot], grayValues[graySlot], grayValues[graySlot]) <
-			distance(r, g, b, cube[ri], cube[gi], cube[bi])
-		? grayIndex
-		: cubeIndex;
-	return `\x1b[48;5;${index}m`;
-}
-
-/** The opaque fullscreen canvas ANSI prefix, or null to inherit the terminal.
- *  Environment override wins; otherwise the active theme's known canvas. */
-function canvasAnsi(): string | null {
-	const mode = String(liveState.activeTheme?.getColorMode?.() ?? "truecolor");
-	if (CANVAS_ENV) {
-		return /^(?:0|false|off|no|none)$/i.test(CANVAS_ENV) ? null : hexToBgAnsi(CANVAS_ENV, mode);
-	}
-	const hex = CANVAS_BY_THEME[String(liveState.activeTheme?.name ?? "")];
-	return hex ? hexToBgAnsi(hex, mode) : null;
-}
-
-/** Paint one rewritten row: canvas background under the line, then canvas
- *  padding to the full terminal width. Kitty/iTerm2 image rows are untouched.
- *  Any full SGR or background reset (overlay/scrollbar composition, line resets)
- *  would otherwise punch a terminal-default hole through the surface, so the
- *  canvas is re-applied after every reset inside the segment. */
-function paintCanvasSegment(seg: string, width: number, ansi: string): string {
-	// Paint image-row cells first, return to column one, then emit the original
-	// Kitty/iTerm payload byte-for-byte. This fills uncovered image-row columns
-	// without wrapping or modifying the transport sequence itself.
-	if (CANVAS_IMAGE_RE.test(seg)) return `${ansi}${" ".repeat(width)}\x1b[0m\r${seg}`;
-	const body = seg.replace(/\x1b\[([0-9;]*)m/g, (sgr, params: string) => {
-		const codes = params === "" ? [0] : params.split(";").map(Number);
-		return codes.includes(0) || codes.includes(49) ? `${sgr}${ansi}` : sgr;
-	});
-	const pad = Math.max(0, width - colWidth(seg));
-	if (pad === 0) return `${ansi}${body}\x1b[0m`;
-	return `${ansi}${body}\x1b[0m${ansi}${" ".repeat(pad)}\x1b[0m`;
-}
-
-/** Rewrite a fullscreen frame buffer so every emitted row carries the opaque
- *  canvas background. Only rows the renderer actually rewrites appear in the
- *  buffer; unchanged rows keep their already-painted terminal state, and the
- *  final cursor positioning escape is left outside any paint wrap. */
-function paintScreenBuffer(buffer: string, width: number, ansi = canvasAnsi()): string {
-	if (!ansi || width <= 0) return buffer;
-	const pieces = buffer.split(CANVAS_ROW_RE);
-	if (pieces.length < 3) return buffer;
-	let out = pieces[0];
-	for (let i = 1; i + 1 < pieces.length; i += 2) {
-		out += `\x1b[${pieces[i]};1H\x1b[2K`;
-		const content = pieces[i + 1];
-		const suffixAt = content.search(CANVAS_SUFFIX_RE);
-		if (suffixAt > 0) {
-			out += paintCanvasSegment(content.slice(0, suffixAt), width, ansi) + content.slice(suffixAt);
-		} else if (suffixAt === -1) {
-			out += paintCanvasSegment(content, width, ansi);
-		} else {
-			// An empty final row can begin immediately with cursor/sync suffixes.
-			// Paint its cells before emitting that suffix unchanged.
-			out += paintCanvasSegment("", width, ansi) + content;
-		}
-	}
-	return out;
 }
 
 // ── tool-card grouping (line-level pass over the final TUI render) ───────────
@@ -536,7 +438,6 @@ export default function ampStyle(pi: ExtensionAPI) {
 	patchToolCards();
 	patchCardGrouping();
 	patchPendingMessages();
-	patchCanvasPaint();
 	patchEditor();
 	if (failedPatches.length) {
 		const msg = `amp-pi-style: degraded enhancements: ${failedPatches.join(", ")} — safe or stock fallbacks active`;
@@ -664,7 +565,7 @@ function wireEvents(pi: ExtensionAPI) {
 	});
 }
 
-/** User messages: canvas-flat prompt row with Grok's vertical rhythm and arrow. */
+/** User messages: flat prompt row with Grok's vertical rhythm and arrow. */
 function patchUserMessages() {
 	const proto = UserMessageComponent?.prototype as any;
 	if (!proto) return guard("userMessages", false);
@@ -973,51 +874,6 @@ function patchCardGrouping() {
 	liveState.framePassReady = patched;
 }
 
-/** Paint the fullscreen frame onto an opaque canvas so the Grok look survives
- *  translucent terminals and foreign themes. Wraps `TuiAltScreen.doRender` and,
- *  while it runs, intercepts the single per-frame `terminal.write` to fill every
- *  rewritten row. Unchanged rows keep their painted state; inline main-screen
- *  mode is untouched so scrollback never fills with colored blocks. Missing or
- *  renamed internals degrade to terminal-inheriting (stock) rendering. */
-function patchCanvasPaint() {
-	const proto = TuiAltScreen?.prototype as any;
-	if (!proto) {
-		guard("canvasPaint", false);
-		return;
-	}
-	if (proto.__ampStyleCanvas) return;
-	const origDoRender = proto.doRender;
-	if (typeof origDoRender !== "function") {
-		guard("canvasPaint", false);
-		return;
-	}
-	proto.__ampStyleCanvas = true;
-	proto.doRender = function (this: any) {
-		applyFullscreenGutter(this);
-		const term = this.terminal;
-		const origWrite = term?.write;
-		if (typeof origWrite !== "function") return origDoRender.call(this);
-		const nextCanvas = canvasAnsi();
-		if (this.__ampCanvasAnsi !== nextCanvas) {
-			// Pi's alternate-screen renderer is differential. Force one full frame
-			// whenever the canvas changes (including known theme → inheritance),
-			// otherwise unchanged blank rows retain the previous background.
-			this.__ampCanvasAnsi = nextCanvas;
-			this.previousScreen = [];
-			this.previousScreenWidth = 0;
-			this.previousScreenHeight = 0;
-		}
-		term.write = (buffer: unknown) => {
-			origWrite.call(term, paintScreenBuffer(String(buffer), Math.max(1, this.terminal?.columns ?? 80), nextCanvas));
-		};
-		try {
-			return origDoRender.call(this);
-		} finally {
-			term.write = origWrite;
-		}
-	};
-}
-
 /** Status keys hidden from the footer. `cursor` (pi-cursor-sdk's
  *  `cursor:local · fast:on`) is redundant — the model already shows in the
  *  editor border. */
@@ -1025,11 +881,11 @@ const HIDDEN_STATUS_KEYS = new Set(["cursor"]);
 
 let liveRegionApplied = false;
 /** Install Grok's dedicated turn-status row as Pi's official above-editor
- *  widget. It owns the only activity spinner and its repaint timer, and leaves
- *  a stable prompt gap. The stock working indicator is disabled through Pi's
- *  official API (retry/compaction rows stay stock). Runs once per session;
- *  the session_shutdown handler resets it so the widget reinstalls for the
- *  next session. */
+ *  widget. It owns the only activity indicator (thinking-orbs by default) and
+ *  its repaint timer, and leaves a stable prompt gap. The stock working
+ *  indicator is disabled through Pi's official API (retry/compaction rows stay
+ *  stock). Runs once per session; the session_shutdown handler resets it so
+ *  the widget reinstalls for the next session. */
 function applyLiveRegion(ctx: any) {
 	if (liveRegionApplied || !ctx?.hasUI) return;
 	if (typeof ctx.ui?.setWidget !== "function" || typeof ctx.ui?.setWorkingVisible !== "function") {
@@ -1047,6 +903,7 @@ function applyLiveRegion(ctx: any) {
 			(tui: any, theme: any) => {
 				liveState.activeTheme = theme;
 				let timer: ReturnType<typeof setInterval> | null = null;
+				const tickMs = orbMode() === "off" ? 135 : 80;
 				const stopTimer = () => {
 					if (timer) {
 						clearInterval(timer);
@@ -1067,18 +924,39 @@ function applyLiveRegion(ctx: any) {
 								try {
 									tui?.requestRender?.();
 								} catch {}
-							}, 135);
+							}, tickMs);
 						} else if (!phase && timer) {
 							stopTimer();
 						}
 						if (!phase) {
-							// Stable 1-row prompt gap so the editor never jumps.
-							return [` ${mark}`];
+							// Stable 1-row prompt gap so the editor never jumps, without
+							// consuming the terminal's final column at transitional widths.
+							return [`${" ".repeat(liveStatusLayout(width, 0).leadingColumns)}${mark}`];
 						}
-						const frame = ACTIVITY_SPIN[Math.floor(Date.now() / 135) % ACTIVITY_SPIN.length];
-						const text = ` ${semantic("accent", frame)} ${semantic("muted", phase)}`;
-						const fitted = hardTrim(text, Math.max(1, width - 1));
-						return [`${fitted}${mark}`];
+						if (orbMode() === "off") {
+							const frame = ACTIVITY_SPIN[Math.floor(Date.now() / tickMs) % ACTIVITY_SPIN.length];
+							const layout = liveStatusLayout(width, 1);
+							const indicator = hardTrim(semantic("accent", frame), layout.indicatorColumns);
+							const label = hardTrim(semantic("muted", phase), layout.labelColumns);
+							return [
+								`${" ".repeat(layout.leadingColumns)}${indicator}${" ".repeat(layout.gapColumns)}${label}${mark}`,
+							];
+						}
+						const state = phaseToOrbState(phase);
+						const tint =
+							ORB_ACCENT_BY_THEME[String(liveState.activeTheme?.name ?? "")] ??
+							ORB_ACCENT_BY_THEME["amp-style"];
+						const orb = renderOrbGlyph(state, Date.now() / 1000, {
+							dark: true,
+							tint,
+							style: (s) => semantic("accent", s),
+						});
+						const layout = liveStatusLayout(width, orbColumns());
+						const indicator = hardTrim(orb, layout.indicatorColumns);
+						const label = hardTrim(semantic("muted", phase), layout.labelColumns);
+						return [
+							`${" ".repeat(layout.leadingColumns)}${indicator}${" ".repeat(layout.gapColumns)}${label}${mark}`,
+						];
 					},
 					dispose() {
 						stopTimer();
@@ -1121,7 +999,7 @@ function applyFooter(ctx: any) {
 						if (width < 12) return [];
 						const branch = footerData?.getGitBranch?.() ?? "";
 						const cwd = displayPath(Math.max(8, Math.floor(width * 0.4)));
-						const left = [cwd, branch ? `⭠ ${branch}` : ""].filter(Boolean).join("  ");
+						const left = `${semantic("text", cwd)}${branch ? `  ${semantic("muted", `⭠ ${branch}`)}` : ""}`;
 						const pct = contextPercent() ?? "";
 						const statuses = [...(footerData?.getExtensionStatuses?.() ?? new Map()).entries()]
 							.filter(([key]) => !HIDDEN_STATUS_KEYS.has(key))
@@ -1129,7 +1007,7 @@ function applyFooter(ctx: any) {
 							.map(([, t]) => String(t).replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
 							.filter(Boolean);
 						const rightItems = [pct, ...statuses].map((item) => semantic("dim", item));
-						const line = statusLine(semantic("dim", left), rightItems, width);
+						const line = statusLine(left, rightItems, width);
 						return line ? [line] : [];
 					} catch {
 						return [];
@@ -1145,9 +1023,9 @@ function applyFooter(ctx: any) {
 	}
 }
 
-/** Editor: rounded Pi adaptation with Grok's quiet prompt and live state in
- *  the divider. Activity lives in the turn-status widget; cwd/git live in the
- *  footer — the prompt border itself stays quiet. */
+/** Editor: rounded Pi adaptation that fully inherits the terminal background,
+ *  with readable live state in the divider. Activity lives in the turn-status
+ *  widget; cwd/git live in the footer. */
 function patchEditor() {
 	const proto = CustomEditor?.prototype as any;
 	if (!proto) return guard("editor", false);
@@ -1219,7 +1097,7 @@ function patchEditor() {
 
 			const fill = Math.max(1, inner - colWidth(leftPlain) - colWidth(rightPlain));
 			const leftStyled = left ? bc("─") + ` ${semantic("dim", left)} ` : "";
-			const rightStyled = rightLabel ? ` ${semantic("dim", rightLabel)} ${bc("─")}` : "";
+			const rightStyled = rightLabel ? ` ${semantic("text", rightLabel)} ${bc("─")}` : "";
 			const osc = origLine.match(LEADING_OSC_RE)?.[0] ?? "";
 			return osc + bc(leftCorner) + leftStyled + bc("─".repeat(fill)) + rightStyled + bc(rightCorner);
 		};

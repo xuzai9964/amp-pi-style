@@ -217,19 +217,18 @@ Amp 不要求用户先知道哪个模型适合哪个任务，而是询问更贴�
 
 ## 三、视觉语法
 
-### 1. 画布：fullscreen 接管终态，所有普通内容共享一种底色
+### 1. 画布：全部普通内容继承终端
 
-这套插件的第一视觉签名不是卡片，而是一整块连续的冷黑哑光工作面。fullscreen 模式下，扩展在 TUI 最终帧统一绘制 `vars.canvas`：每个被改写的 cell、ANSI reset 后的片段和行尾剩余宽度都重新落回同一底色。这样即使终端透明、模糊或使用异色主题，transcript、prompt 与 footer 之间也不会出现壁纸渗漏或终端默认色“破洞”。
+这套插件不接管 fullscreen 的整块背景。fullscreen 与 inline 模式都继承终端底色，不再把空白行、transcript、footer、composer 或整个 alternate screen 强制绘制成黑色。这样保留用户自己的终端主题、透明度和模糊效果，也避免产生突兀的矩形色块。
 
 普通内容不建立独立 surface：
 
-- 用户消息、assistant 正文、thinking、工具摘要、live status、composer 内部和 footer 共用 canvas；
-- selection、overlay、视觉选择和语义 diff 是少数允许抬升的表面；
-- focus 不切换背景，只把中性 prompt border 从 `#323237` 提升到 `#505058`；
-- inline 模式继续继承终端，避免向 shell scrollback 写入整行底色；
-- `AMP_PI_CANVAS=#…` 覆盖 canvas，`AMP_PI_CANVAS=0` 恢复终端继承。
+- 用户消息、assistant 正文、thinking、工具摘要、live status、composer 和 footer 全部继承终端；
+- composer 的顶边、输入行和底边都不输出背景色；
+- selection、overlay、视觉选择和语义 diff 继续使用 Pi 的语义背景；
+- focus 只把中性 prompt border 从 `#323237` 提升到 `#505058`。
 
-统一画布不是把所有内容压成同一层。层级改由前景灰阶、字重、符号、缩进和稳定空白承担。品牌也主要通过这些要素表达，而不是通过一堆略有不同的黑色矩形。
+层级由前景灰阶、字重、符号、缩进、边框和稳定空白承担，不依赖额外的黑色矩形表面。
 
 ### 2. 色彩：角色优先于色值
 
@@ -393,7 +392,7 @@ Pending → Running → Completed
 
 ### 5. Composer
 
-Composer 是用户注意力的重置点，但只保留最低响度的状态带。运行状态和位置不占用输入边框——活动移到 turn-status 行，cwd/git 移到 footer，边框只保留模型与思考模式：
+Composer 是用户注意力的重置点，但不建立独立背景表面。运行状态和位置不占用输入边框——活动移到 turn-status 行，cwd/git 移到 footer，边框只保留模型与思考模式：
 
 ```text
 ⠋ Editing 2 files…
@@ -406,8 +405,10 @@ Composer 是用户注意力的重置点，但只保留最低响度的状态带�
 关键规则：
 
 - 中心始终是输入，`❯` 标识输入行；
+- 输入框全部继承终端底色，包括顶边、输入行和底边；
 - 边框空闲时使用 `#323237`，聚焦时只提升到中性 `#505058`，不调用 accent；
-- 下边界只承载模型/模式信息；
+- 下边界的模型/模式使用主前景色，不能降到难以辨认的 `dim`；
+- footer 左侧 cwd 使用主前景色，git branch 使用 `muted`；
 - 运行状态有且只有一个住所：编辑器上方的 turn-status 行；
 - 空间不足时低优先级信息先消失，footer 从右侧逐项丢弃。
 

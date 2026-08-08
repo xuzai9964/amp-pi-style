@@ -1,6 +1,6 @@
 # amp-pi-style
 
-Grok-informed visual styling for the [pi coding agent](https://github.com/earendil-works/pi): one owned matte canvas, a calm engineering transcript, operation-first tools, and live state close to the composer. The package and theme names remain unchanged for backward compatibility.
+Grok-informed visual styling for the [pi coding agent](https://github.com/earendil-works/pi): a terminal-native canvas, a quiet rounded composer, operation-first tools, and readable live state close to the prompt. The package and theme names remain unchanged for backward compatibility.
 
 The update draws from [xai-org/grok-build](https://github.com/xai-org/grok-build), adapting only presentation patterns that Pi can represent safely. See [DESIGN_LANGUAGE.md](./DESIGN_LANGUAGE.md) for the detailed Chinese-language design model.
 
@@ -9,7 +9,7 @@ The update draws from [xai-org/grok-build](https://github.com/xai-org/grok-build
 **Transcript first**
 
 - Flat, single-column rendering with no chat bubbles, no transcript cards, one stable blank line between blocks, and a shared two-column fullscreen gutter.
-- User prompts stay on the same canvas as the transcript and use only a `❯` arrow plus vertical rhythm. Wrapped and explicit continuation lines align beneath the prompt without disturbing OSC semantic-prompt marks.
+- User prompt echoes inherit the terminal background and use only a `❯` arrow plus vertical rhythm. Wrapped and explicit continuation lines align beneath the prompt without disturbing OSC semantic-prompt marks.
 - Assistant responses remain plain, incrementally rendered Markdown. Pi owns thinking visibility and `ctrl+t`; visible thinking is recommended to match Grok's progressive-disclosure model.
 - Completed tools become expandable semantic summaries:
 
@@ -27,32 +27,32 @@ The update draws from [xai-org/grok-build](https://github.com/xai-org/grok-build
 **Live region: turn-status row, quiet prompt, agent-status footer**
 
 ```text
-⠋ Editing 2 files…
+⢎⡴ Editing 2 files…
 ╭───────────────────────────────────────────╮
 │ ❯ next instruction                        │
 ╰─ claude-sonnet-4 ─ high ──────────────────╯
 ~/repo/app ⭠ main              18%  extension state
 ```
 
-- A dedicated turn-status row sits above the prompt: the only activity spinner, one stable line that never shifts the editor. It replaces Pi's stock `Working...` indicator (disabled through the official API), so `Thinking…`, `Responding…`, `Searching 2 patterns…`, `Running 3 commands…`, `Reading 1 file…`, or `Editing 2 files…` live there instead of in the border.
-- The rounded prompt uses quiet borders that only brighten when focused, a `❯` input prefix, and keeps model/mode information in its bottom divider. Scroll indicators such as `↑ 4 more` and `↓ 2 more` remain intact.
-- The footer becomes a separate agent-status row that never shares the prompt border: abbreviated cwd and git branch at the left, context usage and extension statuses at the right.
+- A dedicated turn-status row sits above the prompt: the only activity indicator, one stable line that never shifts the editor. It replaces Pi's stock `Working...` indicator (disabled through the official API). By default the indicator is a cute two-cell Braille port of [thinking-orbs](https://orbs.jakubantalik.com), mapped by phase — `Thinking…` breathes, `Searching…` scans, `Editing…` morphs shapes, `Responding…` composes, and so on. Braille keeps the row on pi-tui's normal text/background path; inline Kitty graphics are intentionally avoided because pi-tui treats mixed image-and-text rows as image-only. Set `AMP_PI_ORBS=off` to restore the legacy spinner.
+- The rounded prompt fully inherits the terminal background. Its borders brighten when focused, a `❯` prefixes input, and high-contrast model/mode information stays visible in the bottom divider. Scroll indicators such as `↑ 4 more` and `↓ 2 more` remain intact.
+- The footer becomes a separate agent-status row that never shares the prompt border: readable cwd and git branch at the left, context usage and extension statuses at the right.
 - Queued steering becomes a flat diamond summary row: the latest instruction stays visible, multiple queued messages compress to a count, and `Enter to steer` keeps the interaction discoverable.
 - The cwd keeps its origin and meaningful tail with middle elision, for example `~/Library/…/project/src`.
 - Experimental pinned-composer mode keeps the lower frame at the terminal bottom while a short transcript grows upward; it defaults on for macOS and remains environment-toggleable.
 - Retry and compaction notices remain stock.
 
-**Single opaque canvas in fullscreen**
+**Terminal-native canvas, quiet composer**
 
-- In fullscreen (alternate-screen) mode the extension owns the final frame and paints every rewritten cell, reset span, and right-side padding column onto one opaque canvas. Transcript, user prompts, tools, live status, composer, and footer therefore read as one continuous matte surface, even in translucent or blurred terminals.
-- Selection, overlays, and semantic diff states are the only deliberate raised surfaces. Ordinary user, assistant, custom, pending, successful, and failed tool rows do not receive independent backgrounds.
-- The canvas comes from the theme's `vars.canvas`, is overridable with `AMP_PI_CANVAS=#1a1a1a`, and `AMP_PI_CANVAS=0` restores terminal-inheriting behavior. Inline mode always inherits the terminal so scrollback is never flooded with colored blocks.
+- Fullscreen and inline modes both inherit the terminal background. The extension does not paint blank rows, transcript lines, or the full alternate screen black.
+- The composer also inherits the terminal background on every row, including its borders and input line.
+- Selection, overlays, and semantic diff states keep their normal Pi backgrounds.
 
 **Quiet semantic themes**
 
-- `amp-style`: values traced directly to Grok Build's `groknight.rs`: `#141414` canvas, neutral `#323237`/`#505058` prompt chrome, restrained violet activity, green success, yellow warning, and pink-red errors.
-- `amp-warm`: the same neutral focus chrome and flat-canvas structure with warm semantic accents and cream text.
-- User prompts and ordinary tool states share the canvas. Only selection, overlays, and semantic diff states step away from it.
+- `amp-style`: values traced directly to Grok Build's `groknight.rs`: neutral `#323237`/`#505058` prompt chrome, restrained violet activity, green success, yellow warning, and pink-red errors.
+- `amp-warm`: the same terminal-inheriting structure with warm semantic accents and cream text.
+- Transcript, tools, and composer rows inherit the terminal; only Pi-owned selection, overlays, and semantic diff states receive backgrounds.
 - Color reinforces meaning but does not create it. `◆`, `✗`, action words, and counts remain understandable under limited-color or `NO_COLOR` conditions.
 
 ## Responsive behavior
@@ -97,16 +97,25 @@ AMP_PI_PIN_COMPOSER=0 pi  # disable
 
 The toggle also accepts `true`/`false`, `yes`/`no`, and `on`/`off` (case-insensitive). When the rendered session is shorter than the terminal, the extension inserts flexible blank rows immediately before the active composer. Those rows yield as transcript content grows, so new content pushes upward while the lower frame stays at the bottom. Once content exceeds the terminal height, Pi's normal bottom viewport takes over.
 
-### Opaque fullscreen canvas
+### Thinking orbs
 
-In fullscreen mode the extension paints every rewritten cell and its remaining row width onto an opaque canvas (each shipped theme defines its `vars.canvas`), so the interface no longer depends on the terminal's background. Full and background-only SGR resets are immediately followed by the canvas color, preventing terminal-default holes inside composed rows. This is useful on translucent terminals or terminals whose theme clashes with the palette:
+The turn-status activity indicator ports the MIT [thinking-orbs](https://github.com/Jakubantalik/thinking-orbs) animation math into a software rasterizer, then samples each frame into a 2-cell Braille glyph. Phase → state mapping:
+
+| Phase | Orb state |
+| --- | --- |
+| Thinking… | breathing |
+| Responding… | composing |
+| Searching… | searching |
+| Running commands… | working |
+| Reading… | connecting |
+| Editing… | shaping |
+| Running tools… | weaving |
 
 ```bash
-AMP_PI_CANVAS=#1a1a1a pi   # override the canvas color
-AMP_PI_CANVAS=0 pi         # inherit the terminal background (default behavior of older releases)
+AMP_PI_ORBS=auto pi     # default: animated two-cell Braille orb
+AMP_PI_ORBS=braille pi  # explicitly select the same safe backend
+AMP_PI_ORBS=off pi      # legacy Braille spinner (⠋⠙⠹…)
 ```
-
-The canvas pass is fullscreen-only and uses a guarded alternate-screen renderer patch because Pi has no official final-frame background API. If that internal changes, the extension safely falls back to terminal inheritance. Set the variable before starting Pi; changing it requires a restart.
 
 ## How it works
 
@@ -116,7 +125,7 @@ Pi does not expose official APIs for every visual surface, so user messages, ass
 
 Live model, thinking, context, and cwd values are copied from active extension events into plain render snapshots. The snapshots are cleared on `session_shutdown`, so session replacement and reload never leave guarded Pi contexts inside timer-driven render paths. Collapsed cards carry an invisible marker, so the final transcript pass never merges lookalike assistant text. That same bounded pass recognizes Pi's own queued-steering rows and turns them into the flat diamond summary row without changing queue behavior.
 
-In fullscreen mode, the extension wraps the alternate-screen renderer and repaints every row it rewrites onto the opaque canvas color. It reapplies the canvas after full SGR and background resets, then fills the untouched width to the terminal edge. Image rows are prefilled before their Kitty/iTerm transport payload is emitted unchanged. Canvas changes force one full redraw so differential rendering cannot retain the old color; cursor and synchronized-output suffixes remain outside row paint. If Pi renames an internal, the canvas patch degrades to terminal-inheriting rendering rather than crashing.
+The composer patch rebuilds only foreground chrome: rounded borders, the `❯` input prefix, and model/mode labels. It preserves leading OSC semantic-prompt marks and emits no background paint, so the entire editor, fullscreen transcript, and terminal scrollback inherit the terminal.
 
 When pinned composer is enabled, the main-screen turn-status widget emits an invisible live-region marker and the editor emits a separate composer fallback marker. The final-frame pass prefers exactly one live-region marker, otherwise requires exactly one composer marker, before padding to the current terminal height; dialogs, unsupported custom editors, and incompatible internals therefore fall back without guessing.
 
@@ -126,4 +135,4 @@ This package is purely visual. Grok's typed/selectable scrollback, queue editing
 
 ## License
 
-MIT
+MIT. Thinking-orb animation math is adapted from [Jakubantalik/thinking-orbs](https://github.com/Jakubantalik/thinking-orbs) (MIT); see [NOTICE](./NOTICE).
